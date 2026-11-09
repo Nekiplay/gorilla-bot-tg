@@ -10,7 +10,8 @@ mod casino;
 mod config;
 
 use std::io::{self, BufRead as _, Write as _};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use casino::{Martingale, Outcome};
@@ -31,6 +32,16 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const SCAN_FILE: &str = "gorilla_scan.txt";
 const LOG_FILE: &str = "gorilla_log.txt";
 
+/// Файлы данных (сессия, логи, скан) лежат рядом с config.json, а не в текущей папке.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn data_path(name: &str) -> PathBuf {
+    match DATA_DIR.get() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
@@ -41,6 +52,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let _ = DATA_DIR.set(cfg.base_dir.clone());
 
     let result = match mode.as_str() {
         "login" => login(&cfg).await,
@@ -76,10 +88,11 @@ async fn connect(
     allow_unauthorized: bool,
 ) -> Result<(Client, mpsc::Receiver<UpdatesLike>, SenderPoolFatHandle, JoinHandle<()>), BoxError>
 {
+    let session_path = data_path(&cfg.session_file);
     let session = Arc::new(
-        SqliteSession::open(&cfg.session_file)
+        SqliteSession::open(&session_path)
             .await
-            .map_err(|e| format!("не удалось открыть {}: {e}", cfg.session_file))?,
+            .map_err(|e| format!("не удалось открыть {}: {e}", session_path.display()))?,
     );
 
     let SenderPool {
@@ -94,7 +107,7 @@ async fn connect(
     if !allow_unauthorized && !client.is_authorized().await? {
         return Err(format!(
             "нет активной сессии в {} — сначала сделай `gorilla-bot login`",
-            cfg.session_file
+            session_path.display()
         )
         .into());
     }
@@ -164,7 +177,7 @@ async fn login(cfg: &Config) -> Result<(), BoxError> {
     println!(
         "Готово, {}! Сессия сохранена в {}.",
         me.first_name().unwrap_or("?"),
-        cfg.session_file
+        data_path(&cfg.session_file).display()
     );
 
     handle.quit();
@@ -208,8 +221,12 @@ async fn scan(cfg: &Config) -> Result<(), BoxError> {
         let who = if *outgoing { "Я" } else { "Бот" };
         let _ = writeln!(out, "{date} | id={id} | {who} | {text}");
     }
-    std::fs::write(SCAN_FILE, &out)?;
-    println!("Сохранено {} сообщений в {SCAN_FILE}.", messages.len());
+    std::fs::write(data_path(SCAN_FILE), &out)?;
+    println!(
+        "Сохранено {} сообщений в {}.",
+        messages.len(),
+        data_path(SCAN_FILE).display()
+    );
 
     handle.quit();
     let _ = pool_task.await;
@@ -387,7 +404,10 @@ fn append_log(line: &str) -> Result<(), BoxError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut file = OpenOptions::new().create(true).append(true).open(LOG_FILE)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_path(LOG_FILE))?;
     writeln!(file, "{secs} | {line}")?;
     Ok(())
 }

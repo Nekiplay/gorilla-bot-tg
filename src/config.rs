@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Настройки бота.
 #[derive(Debug, Clone, Deserialize)]
@@ -21,6 +21,9 @@ pub struct Config {
     #[serde(default = "default_session_file")]
     pub session_file: String,
     pub casino: CasinoConfig,
+    /// Папка, где лежит config.json; от неё считаются пути сессии/логов.
+    #[serde(skip)]
+    pub base_dir: PathBuf,
 }
 
 /// Настройки авто-казино (мартингейл).
@@ -90,15 +93,40 @@ fn default_cooldown_margin() -> u64 {
 }
 
 impl Config {
-    /// Читает `config.json` из текущей папки.
+    /// Читает `config.json`: сначала в текущей папке, затем рядом с exe
+    /// и вверх по дереву (чтобы exe работал и из `target\release`).
     pub fn load() -> Result<Self, String> {
-        Self::load_path("config.json")
+        let mut candidates: Vec<PathBuf> = vec![PathBuf::from("config.json")];
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(mut dir) = exe.parent().map(Path::to_path_buf) {
+                for _ in 0..5 {
+                    candidates.push(dir.join("config.json"));
+                    match dir.parent() {
+                        Some(parent) => dir = parent.to_path_buf(),
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        for path in &candidates {
+            if path.is_file() {
+                return Self::load_path(path);
+            }
+        }
+        Err("не найден config.json (искал в текущей папке и рядом с gorilla-bot.exe)".into())
     }
 
     pub fn load_path<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref();
         let raw = fs::read_to_string(path)
             .map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("ошибка в {}: {e}", path.display()))
+        let mut cfg: Config =
+            serde_json::from_str(&raw).map_err(|e| format!("ошибка в {}: {e}", path.display()))?;
+        cfg.base_dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Ok(cfg)
     }
 }
