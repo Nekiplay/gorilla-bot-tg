@@ -1,1 +1,8 @@
 /target
+config.json
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+gorilla_scan.txt
+gorilla_log.txt

@@ -1,0 +1,18 @@
+{
+  "api_id": 0,
+  "api_hash": "<api_hash с my.telegram.org>",
+  "phone": "+79991234567",
+  "bot_username": "realgorillabot",
+  "session_file": "gorilla.session",
+  "casino": {
+    "command": "Казино {bet}",
+    "balance_command": "Баланс",
+    "start_bet": 100000,
+    "multiplier": 2.0,
+    "max_bet": 12800000,
+    "max_losses_in_row": 7,
+    "round_gap_secs": 2,
+    "reply_timeout_secs": 90,
+    "cooldown_margin_secs": 2
+  }
+}
