@@ -4,6 +4,12 @@
   "phone": "+79991234567",
   "bot_username": "realgorillabot",
   "session_file": "gorilla.session",
+  "proxy": null,
+  "mtproxy": {
+    "host": "127.0.0.1",
+    "port": 1443,
+    "secret": ""
+  },
   "casino": {
     "command": "Казино {bet}",
     "balance_command": "Баланс",

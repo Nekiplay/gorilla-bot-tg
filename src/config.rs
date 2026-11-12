@@ -20,10 +20,50 @@ pub struct Config {
     /// Файл сессии (sqlite).
     #[serde(default = "default_session_file")]
     pub session_file: String,
+    /// SOCKS5-прокси для соединения с Telegram, например
+    /// `socks5://user:pass@host:port`. Пусто/null — прямое подключение.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// MTProto-прокси (например, TgWsProxy): бот поднимет локальный
+    /// SOCKS5-мост и будет ходить через него.
+    #[serde(default)]
+    pub mtproxy: MtProxyConfig,
     pub casino: CasinoConfig,
     /// Папка, где лежит config.json; от неё считаются пути сессии/логов.
     #[serde(skip)]
     pub base_dir: PathBuf,
+}
+
+/// Параметры настоящего MTProto-прокси (например, TgWsProxy на 127.0.0.1:1443).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MtProxyConfig {
+    /// Адрес прокси.
+    #[serde(default = "default_mtp_host")]
+    pub host: String,
+    /// Порт прокси.
+    #[serde(default = "default_mtp_port")]
+    pub port: u16,
+    /// Секрет (hex, с префиксом dd или без). Пусто — MTProto-мост выключен.
+    #[serde(default)]
+    pub secret: String,
+}
+
+fn default_mtp_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_mtp_port() -> u16 {
+    1443
+}
+
+impl Default for MtProxyConfig {
+    fn default() -> Self {
+        Self {
+            host: default_mtp_host(),
+            port: default_mtp_port(),
+            secret: String::new(),
+        }
+    }
 }
 
 /// Настройки авто-казино (мартингейл).

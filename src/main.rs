@@ -8,6 +8,7 @@
 
 mod casino;
 mod config;
+mod mtproxy;
 
 use std::io::{self, BufRead as _, Write as _};
 use std::path::PathBuf;
@@ -18,7 +19,9 @@ use casino::{Martingale, Outcome};
 use config::{CasinoConfig, Config};
 use grammers_client::client::UpdateStream;
 use grammers_client::peer::Peer;
-use grammers_client::sender::{SenderPool, SenderPoolFatHandle, UpdatesConfiguration};
+use grammers_client::sender::{ConnectionParams, SenderPool, SenderPoolFatHandle, UpdatesConfiguration};
+use grammers_mtproto::transport::Intermediate;
+use grammers_mtsender::ServerAddr;
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
@@ -59,6 +62,8 @@ async fn main() {
         "scan" => scan(&cfg).await,
         "balance" => balance(&cfg).await,
         "casino" => casino_mode(&cfg).await,
+        "check" => check(&cfg).await,
+        "probe" => probe_mode(&cfg).await,
         other => {
             eprintln!("Неизвестный режим «{other}».");
             print_usage();
@@ -78,7 +83,8 @@ fn print_usage() {
          \x20 login    — вход в Telegram (один раз, интерактивно)\n\
          \x20 scan [N] — последние N сообщений с ботом → {SCAN_FILE} (по умолчанию 60)\n\
          \x20 balance  — запросить у бота баланс и показать ответ\n\
-         \x20 casino   — авто-казино: ставка растёт после проигрыша, сброс после выигрыша"
+         \x20 casino   — авто-казино: ставка растёт после проигрыша, сброс после выигрыша\n\
+         \x20 check    — проверить канал связи (MTProto-прокси/SOCKS5), без логина"
     );
 }
 
@@ -95,11 +101,45 @@ async fn connect(
             .map_err(|e| format!("не удалось открыть {}: {e}", session_path.display()))?,
     );
 
+    let proxy_url = if !cfg.mtproxy.secret.trim().is_empty() {
+        // Встроенный мост: локальный SOCKS5 → настоящий MTProto-прокси.
+        let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
+        let target = std::net::SocketAddr::new(
+            cfg.mtproxy
+                .host
+                .trim()
+                .parse()
+                .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
+            cfg.mtproxy.port,
+        );
+        let local = mtproxy::spawn_socks_bridge(target, secret).await?;
+        Some(format!("socks5://{local}"))
+    } else if cfg
+        .proxy
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        cfg.proxy.clone()
+    } else {
+        None
+    };
+    let params = ConnectionParams {
+        proxy_url,
+        transport: if cfg.mtproxy.secret.trim().is_empty() {
+            // Прямое подключение/внешний SOCKS: обычный «Full»-транспорт.
+            Box::new(|| Box::new(grammers_mtproto::transport::Full::new()))
+        } else {
+            // Мост рассчитан на intermediate-кадровку (0xee).
+            Box::new(|| Box::new(Intermediate::new()))
+        },
+        ..Default::default()
+    };
+
     let SenderPool {
         runner,
         handle,
         updates,
-    } = SenderPool::new(session, cfg.api_id);
+    } = SenderPool::with_configuration(session, cfg.api_id, params);
 
     let client = Client::new(handle.clone());
     let pool_task = tokio::spawn(runner.run());
@@ -113,6 +153,101 @@ async fn connect(
     }
 
     Ok((client, updates, handle, pool_task))
+}
+
+/// Режим `probe`: замер реакции MTProto-прокси на handshake (диагностика секрета).
+async fn probe_mode(cfg: &Config) -> Result<(), BoxError> {
+    if cfg.mtproxy.secret.trim().is_empty() {
+        return Err("в config.json не задан mtproxy.secret".into());
+    }
+    let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
+    let target = std::net::SocketAddr::new(
+        cfg.mtproxy
+            .host
+            .trim()
+            .parse()
+            .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
+        cfg.mtproxy.port,
+    );
+    println!("Зонд {target} с секретом из конфига…");
+    println!("{}", mtproxy::probe(target, secret).await);
+    Ok(())
+}
+
+/// Проверка канала связи: поднимает мост/прокси из конфига и делает
+/// настоящий MTProto-обмен (генерация ключа авторизации) с DC2 —
+/// без входа и без отправки кода на телефон.
+async fn check(cfg: &Config) -> Result<(), BoxError> {
+    let proxy_url = if !cfg.mtproxy.secret.trim().is_empty() {
+        let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
+        let target = std::net::SocketAddr::new(
+            cfg.mtproxy
+                .host
+                .trim()
+                .parse()
+                .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
+            cfg.mtproxy.port,
+        );
+        let local = mtproxy::spawn_socks_bridge(target, secret).await?;
+        format!("socks5://{local}")
+    } else if let Some(p) = cfg
+        .proxy
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
+        p.to_string()
+    } else {
+        println!("Прямое подключение (прокси не настроен).");
+        String::new()
+    };
+
+    // Main-адрес DC2: мост сначала пробует main-маршрут, потом медиа.
+    let dc2: std::net::SocketAddr = "149.154.167.50:443".parse().unwrap();
+    let addr = if proxy_url.is_empty() {
+        ServerAddr::Tcp { address: dc2 }
+    } else {
+        ServerAddr::Proxied {
+            address: dc2,
+            proxy: proxy_url,
+        }
+    };
+
+    // Живой сокет — лотерея (мост сам делает редайалы до первого кадра,
+    // но обрывы возможны и середине DH), поэтому несколько попыток.
+    let use_intermediate = !cfg.mtproxy.secret.trim().is_empty();
+    let mut last_err = String::new();
+    let mut ok = false;
+    for attempt in 1..=3u32 {
+        println!("Попытка {attempt} из 3: генерация ключа авторизации с DC2…");
+        let result = if use_intermediate {
+            grammers_mtsender::connect(Intermediate::new(), addr.clone())
+                .await
+                .map(|_| ())
+        } else {
+            grammers_mtsender::connect(grammers_mtproto::transport::Full::new(), addr.clone())
+                .await
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                ok = true;
+                break;
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!("  не вышло: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    if ok {
+        println!("✔️ Канал работает: ключ авторизации сгенерирован через DC2.");
+        Ok(())
+    } else {
+        eprintln!("❌ Канал не работает: {last_err}");
+        Err("проверка канала не прошла".into())
+    }
 }
 
 /// Читает строку с клавиатуры (для интерактивного логина).
