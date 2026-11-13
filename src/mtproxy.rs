@@ -18,9 +18,11 @@ use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
 
 pub type AesCtr256 = Ctr128BE<Aes256>;
 
@@ -276,6 +278,82 @@ async fn socks_reply(stream: &mut TcpStream, code: u8) -> Result<(), String> {
         .map_err(|e| format!("socks-ответ: {e}"))
 }
 
+/// Принимает SOCKS5-рукопожатие и CONNECT-запрос, отвечает клиенту успехом.
+/// Возвращает IP назначения и знаковый индекс DC (отрицательный — медиа).
+async fn socks_accept(client: &mut TcpStream) -> Result<(IpAddr, i16), String> {
+    // --- SOCKS5 greeting ---
+    let mut greeting = [0; 2];
+    client
+        .read_exact(&mut greeting)
+        .await
+        .map_err(|e| format!("greeting: {e}"))?;
+    if greeting[0] != 5 {
+        return Err("не SOCKS5-клиент".into());
+    }
+    let mut methods = vec![0u8; usize::from(greeting[1])];
+    client
+        .read_exact(&mut methods)
+        .await
+        .map_err(|e| format!("methods: {e}"))?;
+    if !methods.contains(&0) {
+        client.write_all(&[5, 0xff]).await.map_err(|e| e.to_string())?;
+        return Err("клиент требует SOCKS5-авторизацию".into());
+    }
+    client
+        .write_all(&[5, 0])
+        .await
+        .map_err(|e| format!("auth-ответ: {e}"))?;
+
+    // --- SOCKS5 CONNECT request ---
+    let mut request = [0; 4];
+    client
+        .read_exact(&mut request)
+        .await
+        .map_err(|e| format!("запрос: {e}"))?;
+    if request[0] != 5 || request[2] != 0 {
+        socks_reply(client, 1).await?;
+        return Err("некорректный SOCKS5-запрос".into());
+    }
+    if request[1] != 1 {
+        socks_reply(client, 7).await?;
+        return Err("поддержан только CONNECT".into());
+    }
+    let dst_ip: IpAddr = match request[3] {
+        1 => {
+            let mut b = [0; 4];
+            client.read_exact(&mut b).await.map_err(|e| e.to_string())?;
+            b.into()
+        }
+        4 => {
+            let mut b = [0; 16];
+            client.read_exact(&mut b).await.map_err(|e| e.to_string())?;
+            b.into()
+        }
+        3 => {
+            let len = client.read_u8().await.map_err(|e| e.to_string())? as usize;
+            let mut b = vec![0u8; len];
+            client.read_exact(&mut b).await.map_err(|e| e.to_string())?;
+            std::str::from_utf8(&b)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or("SOCKS-домен вместо IP не поддержан")?
+        }
+        _ => {
+            socks_reply(client, 8).await?;
+            return Err("неизвестный тип адреса SOCKS".into());
+        }
+    };
+    let _dst_port = client.read_u16().await.map_err(|e| e.to_string())?;
+
+    let Some(dc_idx) = dc_by_ip(dst_ip) else {
+        socks_reply(client, 2).await?;
+        return Err(format!("адрес {dst_ip} не опознан как известный DC Telegram"));
+    };
+
+    socks_reply(client, 0).await?;
+    Ok((dst_ip, dc_idx))
+}
+
 /// Результат успешной «фиксации» на живом сокете прокси.
 struct Latched {
     upstream: TcpStream,
@@ -301,7 +379,7 @@ async fn latch_upstream(
 ) -> Result<Latched, String> {
     const PENDING_CAP: usize = 256 * 1024;
     const FRAME_LEN_CAP: usize = 8 * 1024 * 1024;
-    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const MAX_ATTEMPTS: u32 = 60;
 
     let media_idx = if dc_idx > 0 { -dc_idx } else { dc_idx };
@@ -346,8 +424,14 @@ async fn latch_upstream(
         }
 
         // Гонка: первый кадр апстрима / новые байты клиента / таймаут попытки.
+        // ВСЕ маршруты Flowseal (pool/CF/worker/TCP) начинают поток клиента
+        // 64-байтовым эхом relay-init (их bridge_ws_reencrypt не вычитает его),
+        // и только потом идут кадры MTProto. Эхо обязано быть пропущено,
+        // иначе первые 4 байта случайности читаются как «длина кадра» и живой
+        // ответ выбрасывается как мусор.
         let attempt_deadline = tokio::time::Instant::now() + ATTEMPT_TIMEOUT;
         let mut up_plain: Vec<u8> = Vec::new();
+        let mut echo_skipped = 0usize;
         let (mut latched, mut failed, mut client_gone) = (false, false, false);
         let mut bad_frame = 0usize;
         let mut up_buf = [0u8; 16 * 1024];
@@ -360,8 +444,15 @@ async fn latch_upstream(
                     Ok(n) => {
                         let data = &mut up_buf[..n];
                         dec.apply_keystream(data);
-                        up_plain.extend_from_slice(data);
-                        if up_plain.len() >= 4 {
+                        let plain = if echo_skipped < 64 {
+                            let take = std::cmp::min(64 - echo_skipped, n);
+                            echo_skipped += take;
+                            &data[take..]
+                        } else {
+                            data
+                        };
+                        up_plain.extend_from_slice(plain);
+                        if echo_skipped == 64 && !up_plain.is_empty() && up_plain.len() >= 4 {
                             let flen = u32::from_le_bytes([
                                 up_plain[0], up_plain[1], up_plain[2], up_plain[3],
                             ]) as usize;
@@ -408,10 +499,12 @@ async fn latch_upstream(
         }
         let reason = if bad_frame != 0 {
             format!("мусорный кадр len={bad_frame}")
+        } else if echo_skipped < 64 {
+            format!("эхо {echo_skipped}/64")
         } else if up_plain.is_empty() {
-            "молчит".to_string()
+            "эхо есть, кадра нет".to_string()
         } else {
-            format!("обрыв на {} Б", up_plain.len())
+            format!("обрыв на {} Б кадра", up_plain.len())
         };
         println!("[мост] попытка {attempt} ({route_name}): апстрим «{reason}» — редайал");
         let _ = upstream.shutdown().await;
@@ -435,74 +528,108 @@ async fn latch_upstream(
 /// Полный цикл одного клиента: SOCKS5-переговоры → obfuscated2-рукопожатие
 /// с настоящим прокси (с редайалом до первого кадра) → двунаправленная
 /// пересылка с фиксацией на живом сокете.
+/// Запускает локальный SOCKS5-мост через Cloudflare-Worker пользователя:
+/// `wss://<worker>/apiws?dst=<IP DC>&dc=<N>` — воркер сам открывает TCP к DC.
+/// Внутри туннеля идёт чистый MTProto (intermediate): DPI видит только TLS
+/// к `workers.dev`, а до DC пакеты идут уже из сети Cloudflare.
+pub async fn spawn_worker_bridge(worker: String) -> Result<SocketAddr, String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("не удалось занять локальный порт под мост: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("адрес моста: {e}"))?;
+
+    let worker = Arc::new(worker);
+    println!("[воркер] локальный SOCKS5: {local} → WSS {worker}");
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let worker = Arc::clone(&worker);
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_worker_client(stream, &worker).await {
+                            eprintln!("[воркер] соединение закрыто: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[воркер] приём подключений: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    Ok(local)
+}
+
+/// Одно клиентское подключение через worker: SOCKS5 → WSS → DC.
+async fn serve_worker_client(mut client: TcpStream, worker: &str) -> Result<(), String> {
+    let (dst_ip, dc_idx) = socks_accept(&mut client).await?;
+    let url = format!(
+        "wss://{worker}/apiws?dst={dst_ip}&dc={}",
+        dc_idx.abs()
+    );
+
+    let (ws, _response) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .map_err(|_| format!("таймаут WSS-подключения к {worker}"))?
+    .map_err(|e| format!("WSS {worker}: {e}"))?;
+
+    let (mut ws_send, mut ws_recv) = ws.split();
+    let (mut from_client, mut to_client) = client.split();
+
+    let up = async {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = from_client
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("клиент→воркер: {e}"))?;
+            if n == 0 {
+                return Ok::<(), String>(());
+            }
+            ws_send
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await
+                .map_err(|e| format!("отправка в воркер: {e}"))?;
+        }
+    };
+    let down = async {
+        loop {
+            match ws_recv.next().await {
+                Some(Ok(Message::Binary(bytes))) => {
+                    to_client
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| format!("воркер→клиент: {e}"))?;
+                }
+                Some(Ok(Message::Text(text))) => {
+                    to_client
+                        .write_all(text.as_str().as_bytes())
+                        .await
+                        .map_err(|e| format!("воркер→клиент: {e}"))?;
+                }
+                Some(Ok(Message::Close(_))) | None => return Ok::<(), String>(()),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(format!("WSS-поток: {e}")),
+            }
+        }
+    };
+
+    tokio::select! {
+        result = up => result,
+        result = down => result,
+    }
+}
+
 async fn serve_client(mut client: TcpStream, target: &Target) -> Result<(), String> {
-    // --- SOCKS5 greeting ---
-    let mut greeting = [0; 2];
-    client
-        .read_exact(&mut greeting)
-        .await
-        .map_err(|e| format!("greeting: {e}"))?;
-    if greeting[0] != 5 {
-        return Err("не SOCKS5-клиент".into());
-    }
-    let mut methods = vec![0u8; usize::from(greeting[1])];
-    client
-        .read_exact(&mut methods)
-        .await
-        .map_err(|e| format!("methods: {e}"))?;
-    if !methods.contains(&0) {
-        client.write_all(&[5, 0xff]).await.map_err(|e| e.to_string())?;
-        return Err("клиент требует SOCKS5-авторизацию".into());
-    }
-    client.write_all(&[5, 0]).await.map_err(|e| format!("auth-ответ: {e}"))?;
-
-    // --- SOCKS5 CONNECT request ---
-    let mut request = [0; 4];
-    client
-        .read_exact(&mut request)
-        .await
-        .map_err(|e| format!("запрос: {e}"))?;
-    if request[0] != 5 || request[2] != 0 {
-        socks_reply(&mut client, 1).await?;
-        return Err("некорректный SOCKS5-запрос".into());
-    }
-    if request[1] != 1 {
-        socks_reply(&mut client, 7).await?;
-        return Err("поддержан только CONNECT".into());
-    }
-    let dst_ip: IpAddr = match request[3] {
-        1 => {
-            let mut b = [0; 4];
-            client.read_exact(&mut b).await.map_err(|e| e.to_string())?;
-            b.into()
-        }
-        4 => {
-            let mut b = [0; 16];
-            client.read_exact(&mut b).await.map_err(|e| e.to_string())?;
-            b.into()
-        }
-        3 => {
-            let len = client.read_u8().await.map_err(|e| e.to_string())? as usize;
-            let mut b = vec![0u8; len];
-            client.read_exact(&mut b).await.map_err(|e| e.to_string())?;
-            std::str::from_utf8(&b)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or("SOCKS-домен вместо IP не поддержан")?
-        }
-        _ => {
-            socks_reply(&mut client, 8).await?;
-            return Err("неизвестный тип адреса SOCKS".into());
-        }
-    };
-    let _dst_port = client.read_u16().await.map_err(|e| e.to_string())?;
-
-    let Some(dc_idx) = dc_by_ip(dst_ip) else {
-        socks_reply(&mut client, 2).await?;
-        return Err(format!("адрес {dst_ip} не опознан как известный DC Telegram"));
-    };
-
-    socks_reply(&mut client, 0).await?;
+    let (_, dc_idx) = socks_accept(&mut client).await?;
 
     // --- obfuscated2 к настоящему прокси, с редайалом до живого сокета ---
     let mut pending: Vec<u8> = Vec::new();

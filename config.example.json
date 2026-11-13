@@ -8,17 +8,44 @@
   "mtproxy": {
     "host": "127.0.0.1",
     "port": 1443,
-    "secret": ""
+    "secret": "",
+    "worker": ""
   },
   "casino": {
     "command": "Казино {bet}",
     "balance_command": "Баланс",
     "start_bet": 100000,
     "multiplier": 2.0,
+    "multiplier_jitter": 0.25,
+    "bet_round_to": 1000,
     "max_bet": 12800000,
     "max_losses_in_row": 7,
     "round_gap_secs": 2,
     "reply_timeout_secs": 90,
-    "cooldown_margin_secs": 2
+    "cooldown_margin_secs": 2,
+    "round_gap_jitter_secs": 3
+  },
+  "pet": {
+    "enabled": true,
+    "command": "Питомец поход",
+    "interval_secs": 3840,
+    "interval_jitter_secs": 240,
+    "reply_timeout_secs": 30,
+    "feed_command": "Питомец покормить",
+    "feed_when_hungry": true
+  },
+  "bonus": {
+    "enabled": true,
+    "target": "gorillabot_double",
+    "command": "Бонус",
+    "interval_secs": 900,
+    "jitter_secs": 300
+  },
+  "bonus_dm": {
+    "enabled": true,
+    "target": "realgorillabot",
+    "command": "Бонус",
+    "interval_secs": 43200,
+    "jitter_secs": 300
   }
 }

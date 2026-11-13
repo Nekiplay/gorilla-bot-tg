@@ -6,3 +6,4 @@ config.json
 *.session-shm
 gorilla_scan.txt
 gorilla_log.txt
+gorilla_state.json

@@ -1,11 +1,11 @@
 //! Чтение `config.json`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Настройки бота.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     /// API ID с my.telegram.org.
     pub api_id: i32,
@@ -28,14 +28,25 @@ pub struct Config {
     /// SOCKS5-мост и будет ходить через него.
     #[serde(default)]
     pub mtproxy: MtProxyConfig,
+    /// Настройки авто-казино (мартингейл).
+    #[serde(default)]
     pub casino: CasinoConfig,
+    /// Автоматический поход питомца.
+    #[serde(default)]
+    pub pet: PetConfig,
+    /// Автоотправка «Бонус» в чат/канал по расписанию.
+    #[serde(default)]
+    pub bonus: BonusConfig,
+    /// Второй таймер: «Бонус» в личке бота (цикл около 12 часов).
+    #[serde(default = "default_bonus_dm")]
+    pub bonus_dm: BonusConfig,
     /// Папка, где лежит config.json; от неё считаются пути сессии/логов.
     #[serde(skip)]
     pub base_dir: PathBuf,
 }
 
 /// Параметры настоящего MTProto-прокси (например, TgWsProxy на 127.0.0.1:1443).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MtProxyConfig {
     /// Адрес прокси.
     #[serde(default = "default_mtp_host")]
@@ -46,6 +57,10 @@ pub struct MtProxyConfig {
     /// Секрет (hex, с префиксом dd или без). Пусто — MTProto-мост выключен.
     #[serde(default)]
     pub secret: String,
+    /// Cloudflare-Worker (например, `name.workers.dev`). Если задан —
+    /// используется WSS-труба через него вместо obfuscated2-прокси.
+    #[serde(default)]
+    pub worker: String,
 }
 
 fn default_mtp_host() -> String {
@@ -62,12 +77,13 @@ impl Default for MtProxyConfig {
             host: default_mtp_host(),
             port: default_mtp_port(),
             secret: String::new(),
+            worker: String::new(),
         }
     }
 }
 
 /// Настройки авто-казино (мартингейл).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CasinoConfig {
     /// Шаблон команды: `{bet}` заменяется на текущую ставку.
     #[serde(default = "default_command")]
@@ -78,9 +94,16 @@ pub struct CasinoConfig {
     /// Начальная ставка.
     #[serde(default = "default_start_bet")]
     pub start_bet: u64,
-    /// Во сколько раз увеличивать ставку после проигрыша.
+    /// Во сколько раз увеличивать ставку после проигрыша (базовый множитель).
     #[serde(default = "default_multiplier")]
     pub multiplier: f64,
+    /// Разброс множителя: фактический рост = multiplier * (1 ± jitter),
+    /// чтобы бот не видел идеальный x2. 0.25 = от x1.5 до x2.5.
+    #[serde(default = "default_multiplier_jitter")]
+    pub multiplier_jitter: f64,
+    /// Округление ставки (0 или 1 — без округления).
+    #[serde(default = "default_bet_round_to")]
+    pub bet_round_to: u64,
     /// Потолок ставки; выше — не поднимаемся.
     #[serde(default = "default_max_bet")]
     pub max_bet: u64,
@@ -90,6 +113,10 @@ pub struct CasinoConfig {
     /// Пауза между раундами поверх кулдауна бота, секунды.
     #[serde(default = "default_round_gap")]
     pub round_gap_secs: u64,
+    /// Случайный разброс паузы: фактическая = round_gap_secs ± jitter,
+    /// чтобы бот не видел ровный ритм ставок.
+    #[serde(default = "default_round_gap_jitter")]
+    pub round_gap_jitter_secs: u64,
     /// Сколько секунд ждать ответ бота на команду.
     #[serde(default = "default_reply_timeout")]
     pub reply_timeout_secs: u64,
@@ -116,6 +143,12 @@ fn default_start_bet() -> u64 {
 fn default_multiplier() -> f64 {
     2.0
 }
+fn default_multiplier_jitter() -> f64 {
+    0.25
+}
+fn default_bet_round_to() -> u64 {
+    1_000
+}
 fn default_max_bet() -> u64 {
     12_800_000
 }
@@ -125,11 +158,173 @@ fn default_max_losses() -> u32 {
 fn default_round_gap() -> u64 {
     2
 }
+fn default_round_gap_jitter() -> u64 {
+    3
+}
 fn default_reply_timeout() -> u64 {
     90
 }
 fn default_cooldown_margin() -> u64 {
     2
+}
+
+impl Default for CasinoConfig {
+    fn default() -> Self {
+        Self {
+            command: default_command(),
+            balance_command: default_balance_command(),
+            start_bet: default_start_bet(),
+            multiplier: default_multiplier(),
+            multiplier_jitter: default_multiplier_jitter(),
+            bet_round_to: default_bet_round_to(),
+            max_bet: default_max_bet(),
+            max_losses_in_row: default_max_losses(),
+            round_gap_secs: default_round_gap(),
+            round_gap_jitter_secs: default_round_gap_jitter(),
+            reply_timeout_secs: default_reply_timeout(),
+            cooldown_margin_secs: default_cooldown_margin(),
+        }
+    }
+}
+
+/// Автоматический «Питомец поход»: раз в час бот считает поход завершённым,
+/// но серверу нужно время на обработку, поэтому интервал — около 1 ч 4 мин,
+/// со случайным разбросом (1 ч 3 мин … 1 ч 7 мин).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PetConfig {
+    /// Слать команду автоматически.
+    #[serde(default = "default_pet_enabled")]
+    pub enabled: bool,
+    /// Команда похода.
+    #[serde(default = "default_pet_command")]
+    pub command: String,
+    /// Команда кормления, если бот ответил «покормите своего питомца».
+    /// Пусто — не кормить, просто писать в лог.
+    #[serde(default = "default_feed_command")]
+    pub feed_command: String,
+    /// Кормить автоматически, когда бот просит.
+    #[serde(default = "default_pet_enabled")]
+    pub feed_when_hungry: bool,
+    /// Интервал между отправками, секунды (по умолчанию 3600 + 240).
+    #[serde(default = "default_pet_interval")]
+    pub interval_secs: u64,
+    /// Разброс интервала: фактический = interval_secs ± jitter
+    /// (3840 ± 240 с → от 1 ч 3 мин до 1 ч 7 мин).
+    #[serde(default = "default_pet_jitter")]
+    pub interval_jitter_secs: u64,
+    /// Сколько секунд ждать ответ бота.
+    #[serde(default = "default_pet_timeout")]
+    pub reply_timeout_secs: u64,
+}
+
+fn default_pet_enabled() -> bool {
+    true
+}
+fn default_pet_command() -> String {
+    "Питомец поход".to_string()
+}
+fn default_feed_command() -> String {
+    "Питомец покормить".to_string()
+}
+fn default_pet_interval() -> u64 {
+    3_600 + 240
+}
+fn default_pet_jitter() -> u64 {
+    240
+}
+fn default_pet_timeout() -> u64 {
+    30
+}
+
+impl Default for PetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pet_enabled(),
+            command: default_pet_command(),
+            feed_command: default_feed_command(),
+            feed_when_hungry: true,
+            interval_secs: default_pet_interval(),
+            interval_jitter_secs: default_pet_jitter(),
+            reply_timeout_secs: default_pet_timeout(),
+        }
+    }
+}
+
+/// Автоотправка команды «Бонус» в канал/чат (по умолчанию — канал
+/// t.me/gorillabot_double, «Double Bot Gorilla»).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BonusConfig {
+    /// Слать автоматически.
+    #[serde(default = "default_pet_enabled")]
+    pub enabled: bool,
+    /// @username бота или название чата/канала из списка диалогов.
+    #[serde(default = "default_bonus_target")]
+    pub target: String,
+    /// Команда, которая уходит в чат.
+    #[serde(default = "default_bonus_command")]
+    pub command: String,
+    /// Запасной интервал, секунды: используется, только если бот не назвал
+    /// срок в ответе (по умолчанию 15 минут).
+    #[serde(default = "default_bonus_interval")]
+    pub interval_secs: u64,
+    /// Разброс вокруг срока из ответа бота, ± секунды.
+    #[serde(default = "default_bonus_jitter")]
+    pub jitter_secs: u64,
+}
+
+fn default_bonus_target() -> String {
+    "Double Bot Gorilla".to_string()
+}
+fn default_bonus_command() -> String {
+    "Бонус".to_string()
+}
+fn default_bonus_interval() -> u64 {
+    15 * 60
+}
+fn default_bonus_jitter() -> u64 {
+    5 * 60
+}
+
+/// Бонус в личных сообщениях бота живёт на своём цикле (~12 часов).
+fn default_bonus_dm() -> BonusConfig {
+    BonusConfig {
+        enabled: true,
+        target: "realgorillabot".to_string(),
+        command: default_bonus_command(),
+        interval_secs: 12 * 60 * 60,
+        jitter_secs: 5 * 60,
+    }
+}
+
+impl Default for BonusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target: default_bonus_target(),
+            command: default_bonus_command(),
+            interval_secs: default_bonus_interval(),
+            jitter_secs: default_bonus_jitter(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            api_id: 0,
+            api_hash: String::new(),
+            phone: String::new(),
+            bot_username: default_bot_username(),
+            session_file: default_session_file(),
+            proxy: None,
+            mtproxy: MtProxyConfig::default(),
+            casino: CasinoConfig::default(),
+            pet: PetConfig::default(),
+            bonus: BonusConfig::default(),
+            bonus_dm: default_bonus_dm(),
+            base_dir: PathBuf::from("."),
+        }
+    }
 }
 
 impl Config {
