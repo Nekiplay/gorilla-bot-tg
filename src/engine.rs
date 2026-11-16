@@ -1136,6 +1136,9 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
             }
         };
 
+        // Сколько раз подряд переотправляли ставку, пока бот молчал.
+        let mut resends = 0u32;
+
         loop {
             if !alive(&shared, gen, &cancel) {
                 break 'outer;
@@ -1208,7 +1211,10 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
                     continue 'outer;
                 }
             };
-            mg.note_round();
+            // Переотправка — это та же ставка: раунд считаем один раз.
+            if resends == 0 {
+                mg.note_round();
+            }
             pending = Some(sent.id());
             shared.set_status(|s| {
                 s.rounds = mg.rounds();
@@ -1239,6 +1245,7 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
                     // и засчитала победу дважды.
                     pending = None;
                     fails = 0;
+                    resends = 0;
                     let step = apply_reply(&shared, &cfg, &mut mg, &text, &cancel).await;
                     // Обновляем плитки сразу после результата, а не к следующей
                     // ставке: иначе победа появляется в статусе только спустя раунд.
@@ -1257,8 +1264,18 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
                     }
                 }
                 Ok(Wait::Timeout) => {
-                    stop_casino(&shared, "бот не ответил на ставку");
-                    break 'outer;
+                    // Бот промолчал во все окна: ставку считаем потерянной и
+                    // отправляем её заново, а не останавливаем казино.
+                    pending = None;
+                    resends += 1;
+                    if resends > MAX_RESENDS {
+                        stop_casino(&shared, "бот не отвечает на ставки");
+                        break 'outer;
+                    }
+                    shared.log(format!(
+                        "[казино] бот не ответил — отправляю ставку заново ({resends}/{MAX_RESENDS})"
+                    ));
+                    continue;
                 }
                 Ok(Wait::Cancelled) => {
                     // Ставка уже отправлена: дождёмся её результата, чтобы
@@ -1288,6 +1305,9 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
 
 /// Сколько окон ожидания даём боту на одну ставку.
 const MAX_REPLY_ATTEMPTS: u32 = 3;
+
+/// Сколько раз переотправлять ставку без ответа, прежде чем сдаться.
+const MAX_RESENDS: u32 = 5;
 
 /// Ожидание ответа бота без учёта флага отмены: поздний ответ на уже
 /// отправленную ставку важнее, чем немедленная остановка.
