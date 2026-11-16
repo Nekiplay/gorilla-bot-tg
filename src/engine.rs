@@ -1114,6 +1114,28 @@ async fn captcha_gate(
         crate::click_button(client, bot_ref, message_id, &button.data).await?;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
+    // Бот переписывает сообщение строкой «Выбрано: 1, 4» — сверяем отмеченное.
+    let wanted: Vec<usize> = (0..captcha.tiles.len())
+        .filter(|index| chosen.get(*index).copied().unwrap_or(false))
+        .map(|index| index + 1)
+        .collect();
+    let mut marked: Vec<usize> = Vec::new();
+    for _ in 0..10 {
+        if let Ok(Some(msg)) = crate::latest_message(client, bot_ref, after_id, bot_id).await {
+            if let Some(tiles) = captcha::selected(msg.text()) {
+                marked = tiles;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    if marked.is_empty() {
+        shared.log("[капча] бот не подтвердил выбор плиток");
+    } else if marked == wanted {
+        shared.log(format!("[капча] бот подтвердил выбор: {marked:?}"));
+    } else {
+        shared.log(format!("[капча] бот отметил {marked:?}, ждали {wanted:?}"));
+    }
     if let Some(done) = captcha.buttons.iter().find(|b| b.is_done()) {
         crate::click_button(client, bot_ref, message_id, &done.data).await?;
     }

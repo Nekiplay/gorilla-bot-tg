@@ -78,6 +78,24 @@ pub fn is_captcha(text: &str) -> bool {
     lower.contains("капч") || lower.contains("captcha")
 }
 
+/// Плитки из переотредактированного ботом текста: «Выбрано: 1, 4».
+pub fn selected(text: &str) -> Option<Vec<usize>> {
+    let lower = text.to_lowercase();
+    let start = lower.find("выбрано")?;
+    let line = text[start..].lines().next().unwrap_or("");
+    let tail = line.split_once(':').map(|(_, tail)| tail).unwrap_or("");
+    let tiles: Vec<usize> = tail
+        .split([',', ' ', '.'])
+        .filter_map(|token| token.trim().parse::<usize>().ok())
+        .filter(|tile| *tile > 0)
+        .collect();
+    if tiles.is_empty() {
+        None
+    } else {
+        Some(tiles)
+    }
+}
+
 /// Разбирает картинку капчи: сетка + плитки.
 pub fn parse(message_id: i32, prompt: String, image: &[u8], buttons: Vec<Button>) -> Result<Captcha, String> {
     let img = trim_padding(
@@ -396,6 +414,16 @@ mod tests {
         };
         assert!(done.is_done());
         assert_eq!(done.tile(), None);
+    }
+
+    #[test]
+    fn selected_tiles_are_parsed() {
+        assert_eq!(
+            selected("🤖 Выбрано: 1, 4\nОсталось времени: 9 мин."),
+            Some(vec![1, 4])
+        );
+        assert_eq!(selected("Nekiplay, капча: выбери картинки"), None);
+        assert_eq!(selected("Выбрано: "), None);
     }
 
     #[test]
