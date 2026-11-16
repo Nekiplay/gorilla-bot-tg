@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grammers_client::client::{LoginToken, PasswordToken, SignInError, UpdateStream};
@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::casino::{self, Martingale, Outcome};
+use crate::captcha::{self, Captcha};
 use crate::config::Config;
 use crate::profile::{self, Profile};
 use crate::race::{self, RaceReply};
@@ -153,6 +154,12 @@ pub struct Shared {
     login: Mutex<LoginStage>,
     /// Соединение, открытое на время входа.
     login_conn: AsyncMutex<Option<LoginConn>>,
+    /// Капча от бота, которую надо разметить в окне.
+    captcha: Mutex<Option<Arc<Captcha>>>,
+    /// Выбор плиток из окна: (id сообщения, отмеченные плитки).
+    captcha_choice: Mutex<Option<(i32, Vec<bool>)>>,
+    /// Что сейчас происходит с капчей (подсказка для окна).
+    captcha_note: Mutex<String>,
 }
 
 /// Какой из авто-бонусов: канал или личка бота.
@@ -380,6 +387,9 @@ impl Shared {
             last_profile: Mutex::new(None),
             login: Mutex::new(LoginStage::Idle),
             login_conn: AsyncMutex::new(None),
+            captcha: Mutex::new(None),
+            captcha_choice: Mutex::new(None),
+            captcha_note: Mutex::new(String::new()),
         })
     }
 
@@ -399,6 +409,35 @@ impl Shared {
     pub fn set_status(&self, f: impl FnOnce(&mut Status)) {
         let mut guard = self.status.lock().unwrap();
         f(&mut guard);
+    }
+
+    /// Капча, которую надо пройти прямо сейчас.
+    pub fn captcha(&self) -> Option<Arc<Captcha>> {
+        self.captcha.lock().unwrap().clone()
+    }
+
+    pub fn set_captcha(&self, captcha: Option<Arc<Captcha>>) {
+        *self.captcha.lock().unwrap() = captcha;
+        *self.captcha_choice.lock().unwrap() = None;
+    }
+
+    /// Подсказка/статус капчи для окна.
+    pub fn captcha_note(&self) -> String {
+        self.captcha_note.lock().unwrap().clone()
+    }
+
+    pub fn set_captcha_note(&self, note: impl Into<String>) {
+        *self.captcha_note.lock().unwrap() = note.into();
+    }
+
+    /// Забирает выбор пользователя из окна (одноразово).
+    pub fn take_captcha_choice(&self) -> Option<(i32, Vec<bool>)> {
+        self.captcha_choice.lock().unwrap().take()
+    }
+
+    /// Выбор плиток пользователем: кнопки нажмёт движок.
+    pub fn submit_captcha(&self, message_id: i32, tiles: Vec<bool>) {
+        *self.captcha_choice.lock().unwrap() = Some((message_id, tiles));
     }
 
     /// Текущий этап входа в Telegram.
@@ -914,8 +953,146 @@ async fn login_abort(shared: &Arc<Shared>, reason: &str) {
     }
 }
 
+/// Состояние движка для обработчика капчи (его зовёт `wait_reply`).
+static CAPTCHA_SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+
+/// Сколько ждём разметки капчи в окне.
+const CAPTCHA_WAIT_SECS: u64 = 600;
+
+/// Бот прислал капчу: `true` — её надо разметить, а ответ ждать заново.
+pub(crate) async fn solve_captcha(
+    client: &Client,
+    bot_ref: PeerRef,
+    bot_id: PeerId,
+    after_id: i32,
+) -> bool {
+    let Some(shared) = CAPTCHA_SHARED.get().cloned() else {
+        eprintln!("[капча] пришла капча, а окна нет — размечать негде");
+        return true;
+    };
+    match captcha_gate(&shared, client, bot_ref, bot_id, after_id).await {
+        Ok(()) => true,
+        Err(e) => {
+            shared.log(format!("[капча] {e}"));
+            shared.set_captcha(None);
+            shared.set_captcha_note(format!("не получилось: {e}"));
+            true
+        }
+    }
+}
+
+/// Скачивает картинку капчи, ждёт разметки из окна, нажимает кнопки
+/// и дообучает модель на размеченных плитках.
+async fn captcha_gate(
+    shared: &Arc<Shared>,
+    client: &Client,
+    bot_ref: PeerRef,
+    bot_id: PeerId,
+    after_id: i32,
+) -> Result<(), BoxError> {
+    let Some(msg) = crate::latest_message(client, bot_ref, after_id, bot_id).await? else {
+        return Err("сообщение с капчей не нашлось".into());
+    };
+    let buttons = crate::message_buttons(&msg);
+    if buttons.is_empty() {
+        return Err("у капчи нет inline-кнопок".into());
+    }
+
+    let dir = captcha::model_dir();
+    std::fs::create_dir_all(&dir)?;
+    let image_path = dir.join("last-captcha.img");
+    msg.download_media(&image_path).await?;
+    let bytes = std::fs::read(&image_path)?;
+
+    let parsed = captcha::parse(msg.id(), msg.text().to_string(), &bytes, buttons)
+        .map_err(|e| -> BoxError { e.into() })?;
+    let message_id = parsed.message_id;
+    let tiles = parsed.tiles.len();
+    let hint = if parsed.has_guess() {
+        parsed
+            .suggested()
+            .iter()
+            .enumerate()
+            .filter(|(_, on)| **on)
+            .map(|(i, _)| (i + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    };
+    shared.log(format!(
+        "[капча] {tiles} плиток — разметь во вкладке «Капча»{}",
+        if hint.is_empty() {
+            String::new()
+        } else {
+            format!(" (модель думает: {hint})")
+        }
+    ));
+    shared.set_captcha_note("отметь нужные плитки и нажми «Отправить»");
+    shared.set_captcha(Some(Arc::new(parsed)));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(CAPTCHA_WAIT_SECS);
+    let mut choice: Option<Vec<bool>> = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some((id, tiles)) = shared.take_captcha_choice() {
+            if id == message_id {
+                choice = Some(tiles);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let Some(captcha) = shared.captcha() else {
+        return Err("капча исчезла".into());
+    };
+    let Some(chosen) = choice else {
+        shared.set_captcha(None);
+        return Err(format!("не размечена за {CAPTCHA_WAIT_SECS}с").into());
+    };
+
+    for button in &captcha.buttons {
+        let Some(index) = button.tile() else { continue };
+        if !chosen.get(index - 1).copied().unwrap_or(false) {
+            continue;
+        }
+        crate::click_button(client, bot_ref, message_id, &button.data).await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    if let Some(done) = captcha.buttons.iter().find(|b| b.is_done()) {
+        crate::click_button(client, bot_ref, message_id, &done.data).await?;
+    }
+    shared.log("[капча] выбор отправлен");
+    shared.set_captcha(None);
+
+    // Дообучение: каждая плитка — один пример «нужна/не нужна».
+    let mut added = 0usize;
+    for (index, tile) in captcha.tiles.iter().enumerate() {
+        let needed = chosen.get(index).copied().unwrap_or(false);
+        if captcha::remember(&dir, &captcha::features(tile, captcha.tile_w, captcha.tile_h), needed)
+            .is_ok()
+        {
+            added += 1;
+        }
+    }
+    let train_dir = dir.clone();
+    let trained = tokio::task::spawn_blocking(move || captcha::train(&train_dir))
+        .await
+        .ok()
+        .flatten();
+    let note = match trained {
+        Some(model) => format!("модель обучена на {} плитках", model.samples),
+        None => format!("добавлено {added} плиток — для модели пока мало"),
+    };
+    shared.log(format!("[капча] {note}"));
+    shared.set_captcha_note(note);
+    Ok(())
+}
+
 /// Запуск движка в отдельном потоке со своим tokio-рантаймом.
 pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
+    // Обработчик капчи живёт в wait_reply, а состояние — здесь.
+    let _ = CAPTCHA_SHARED.set(shared.clone());
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

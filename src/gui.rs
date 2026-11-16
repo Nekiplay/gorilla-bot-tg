@@ -6,6 +6,7 @@
 
 mod bonus;
 mod business;
+mod captcha;
 mod casino;
 mod common;
 mod log;
@@ -101,6 +102,7 @@ pub fn start() {
         tab: Tab::Overview,
         code_input: String::new(),
         password_input: String::new(),
+        captcha_view: captcha::Viewer::default(),
     };
 
     let result = eframe::run_native(
@@ -197,6 +199,7 @@ enum Tab {
     Bonus,
     Profile,
     Business,
+    Captcha,
 }
 
 struct App {
@@ -210,6 +213,8 @@ struct App {
     code_input: String,
     /// Ввод пароля 2FA.
     password_input: String,
+    /// Кэш плиток капчи и отметки игрока.
+    captcha_view: captcha::Viewer,
 }
 
 impl App {
@@ -299,6 +304,7 @@ impl eframe::App for App {
                             let last = self.shared.last_bonus(BonusKind::Dm);
                             bonus::bonus_card(self, ui, BonusKind::Dm, left, last);
                         }
+                        Tab::Captcha => captcha::captcha_card(self, ui),
                     });
             });
     }
@@ -318,6 +324,7 @@ impl App {
                     (Tab::Bonus, "Бонус"),
                     (Tab::Business, "Бизнес"),
                     (Tab::Casino, "Казино"),
+                    (Tab::Captcha, "Капча"),
                     (Tab::Telegram, "Telegram"),
                     (Tab::Proxy, "Прокси"),
                 ] {

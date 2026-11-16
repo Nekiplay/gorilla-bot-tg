@@ -11,6 +11,7 @@
 //! * `balance` — спросить у бота баланс и показать ответ;
 //! * `casino`  — автоигра в казино с удвоением ставки после проигрыша.
 
+mod captcha;
 mod casino;
 mod config;
 mod engine;
@@ -26,9 +27,11 @@ use std::time::Duration;
 
 use casino::{Martingale, Outcome};
 use config::{CasinoConfig, Config, WsTunnel};
+use grammers_client::message::Message;
 use grammers_client::client::UpdateStream;
 use grammers_client::peer::Peer;
 use grammers_client::sender::{ConnectionParams, SenderPool, SenderPoolFatHandle, UpdatesConfiguration};
+use grammers_client::tl;
 use grammers_mtproto::transport::Intermediate;
 use grammers_mtsender::ServerAddr;
 use grammers_client::session::storages::SqliteSession;
@@ -1013,6 +1016,10 @@ pub(crate) async fn wait_reply(
                     if skip_noise && is_chat_noise(&text) {
                         continue;
                     }
+                    if captcha::is_captcha(&text) {
+                        crate::engine::solve_captcha(client, bot_ref, bot_id, after_id).await;
+                        continue;
+                    }
                     return Ok(Wait::Reply(id, text));
                 }
             }
@@ -1025,6 +1032,10 @@ pub(crate) async fn wait_reply(
                 {
                     let text = msg.text().trim().to_string();
                     if skip_noise && is_chat_noise(&text) {
+                        continue;
+                    }
+                    if captcha::is_captcha(&text) {
+                        crate::engine::solve_captcha(client, bot_ref, bot_id, after_id).await;
                         continue;
                     }
                     return Ok(Wait::Reply(msg.id(), text));
@@ -1086,6 +1097,67 @@ pub(crate) async fn latest_reply(
         }
     }
     Ok(best)
+}
+
+/// Последнее сообщение бота после `after_id` — вместе с картинкой и кнопками.
+pub(crate) async fn latest_message(
+    client: &Client,
+    bot_ref: PeerRef,
+    after_id: i32,
+    sender_id: PeerId,
+) -> Result<Option<Message>, BoxError> {
+    let mut best: Option<Message> = None;
+    {
+        let mut iter = client.iter_messages(bot_ref).limit(8);
+        while let Some(msg) = iter.next().await? {
+            if msg.outgoing() || msg.id() <= after_id || msg.sender_id() != Some(sender_id) {
+                continue;
+            }
+            if best.as_ref().map_or(true, |m| msg.id() > m.id()) {
+                best = Some(msg);
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// Inline-кнопки сообщения: цифры плиток и «Готово» у капчи.
+pub(crate) fn message_buttons(msg: &Message) -> Vec<captcha::Button> {
+    let Some(tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = msg.reply_markup() else {
+        return Vec::new();
+    };
+    let mut buttons = Vec::new();
+    for row in &markup.rows {
+        let tl::enums::KeyboardInlineButtonRow::Row(row) = row;
+        for button in &row.buttons {
+            let tl::enums::KeyboardInlineButton::Button(button) = button;
+            if let tl::enums::InlineButtonType::Callback(data) = &button.r#type {
+                buttons.push(captcha::Button {
+                    text: button.text.clone(),
+                    data: data.data.clone(),
+                });
+            }
+        }
+    }
+    buttons
+}
+
+/// Нажатие inline-кнопки под сообщением бота.
+pub(crate) async fn click_button(
+    client: &Client,
+    bot_ref: PeerRef,
+    message_id: i32,
+    data: &[u8],
+) -> Result<(), BoxError> {
+    let request = tl::functions::messages::GetBotCallbackAnswer {
+        game: false,
+        peer: bot_ref.into(),
+        msg_id: message_id,
+        data: Some(data.to_vec()),
+        password: None,
+    };
+    client.invoke(&request).await?;
+    Ok(())
 }
 
 
