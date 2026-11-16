@@ -134,6 +134,23 @@ use crate::engine::{Command, Status};
             row(ui, "Команда", |ui| {
                 wide_edit(ui, &mut app.cfg.safe.command, "Сейф {code}");
             });
+            row(ui, "Свой код", |ui| {
+                let mut fixed = app.cfg.safe.code.is_some();
+                if ui.checkbox(&mut fixed, "слать всегда").changed() {
+                    app.cfg.safe.code = if fixed {
+                        Some(app.cfg.safe.code.unwrap_or(42))
+                    } else {
+                        None
+                    };
+                }
+                if let Some(code) = app.cfg.safe.code.as_mut() {
+                    ui.add(
+                        egui::DragValue::new(code)
+                            .range(crate::safe::MIN_CODE..=crate::safe::MAX_CODE)
+                            .speed(1.0),
+                    );
+                }
+            });
             row(ui, "Пауза, с", |ui| {
                 ui.add(
                     egui::DragValue::new(&mut app.cfg.safe.delay_secs)

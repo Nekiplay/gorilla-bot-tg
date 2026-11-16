@@ -512,6 +512,9 @@ pub struct SafeConfig {
     /// Шаблон команды: `{code}` заменяется на код из 1..99.
     #[serde(default = "default_safe_command")]
     pub command: String,
+    /// Фиксированный код: слать его каждый раз. `null` — перебор 1..99.
+    #[serde(default)]
+    pub code: Option<u32>,
     /// Пауза между попытками, секунды.
     #[serde(default = "default_safe_delay")]
     pub delay_secs: f64,
@@ -529,6 +532,7 @@ impl Default for SafeConfig {
     fn default() -> Self {
         Self {
             command: default_safe_command(),
+            code: None,
             delay_secs: default_safe_delay(),
         }
     }

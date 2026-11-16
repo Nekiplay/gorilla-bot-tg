@@ -1385,7 +1385,10 @@ async fn safe_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
         };
 
         let cfg = shared.cfg();
-        let code = bag.next(previous);
+        let code = match cfg.safe.code {
+            Some(code) => code.clamp(crate::safe::MIN_CODE, crate::safe::MAX_CODE),
+            None => bag.next(previous),
+        };
         let command = crate::safe::command(&cfg.safe.command, code);
 
         if !safe_alive(&shared, gen, &cancel) {
