@@ -1,0 +1,14 @@
+[package]
+name = "winicon"
+version = "0.1.0"
+edition = "2021"
+description = "Windows resource (icon, version block) setup for the gorilla-bot binary"
+
+[lib]
+name = "winicon"
+path = "src/lib.rs"
+
+# `winres` is used by the *consuming* crate's build script, so it is a regular
+# dependency here, not a build dependency.
+[target.'cfg(windows)'.dependencies]
+winres = "0.1.12"

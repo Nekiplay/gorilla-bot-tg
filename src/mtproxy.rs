@@ -10,8 +10,10 @@
 //! проекта tg-ws-proxy-rs (MIT, Copyright valnesfjord/tg-ws-proxy-rs authors):
 //! https://github.com/valnesfjord/tg-ws-proxy-rs
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
@@ -22,7 +24,39 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+
+/// Открытый WSS-туннель (воркер или CF-прокси).
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// Стандартные CF-прокси из Flowseal/tg-ws-proxy (`proxy/config.py`,
+/// список `_CFPROXY_ENC`) — те же домены после `_dd()`: буквы каждой метки
+/// сдвинуты назад на их количество, TLD заменён на `.co.uk`.
+/// Свой Cloudflare-worker для них не нужен.
+pub const CF_PROXY_DOMAINS: &[&str] = &[
+    "pclead.co.uk",
+    "offshor.co.uk",
+    "cakeisalie.co.uk",
+    "noskomnadzor.co.uk",
+    "lovetrue.co.uk",
+    "sorokdva.co.uk",
+    "pyatdesyatdva.co.uk",
+    "kartoshka.co.uk",
+    "sorokodin.co.uk",
+    "pyatdesyatodin.co.uk",
+    "notelega.co.uk",
+    "ebally.co.uk",
+    "nebally.co.uk",
+    "havegreatday.co.uk",
+    "pomogite.co.uk",
+    "fixtelega.co.uk",
+    "sadnews.co.uk",
+    "onedaychamp.co.uk",
+    "stopblocking.co.uk",
+    "nothingthere.co.uk",
+];
 
 pub type AesCtr256 = Ctr128BE<Aes256>;
 
@@ -37,6 +71,7 @@ const DC_IDX_POS: usize = 60;
 /// grmers работает с ним, и MTProto-прокси его поддерживает.
 const PROTO_TAG_INTERMEDIATE: [u8; 4] = [0xee, 0xee, 0xee, 0xee];
 
+const PROTO_TAG_ABRIDGED: [u8; 4] = [0xef, 0xef, 0xef, 0xef];
 const RESERVED_FIRST_BYTES: &[u8] = &[0xef];
 const RESERVED_STARTS: &[[u8; 4]] = &[
     *b"HEAD",
@@ -181,6 +216,59 @@ fn generate_client_handshake(
         dec_key.update(secret);
         let dec_key: [u8; 32] = dec_key.finalize().into();
         let dec = make_cipher(&dec_key, &reversed[PREKEY_LEN..]);
+
+        return (handshake, enc, dec);
+    }
+}
+
+/// Транспорт MTProto, которым клиент общается с DC.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Abridged — запасной вариант, grammers ходит intermediate
+enum Proto {
+    Abridged,
+    Intermediate,
+}
+
+/// Обфусцированное рукопожатие для релея через WSS: ключ берётся из самого
+/// заголовка, без хеша секрета (так делает tg-ws-proxy: `relay_init`).
+fn generate_relay_handshake(dc_idx: i16) -> ([u8; HANDSHAKE_LEN], AesCtr256, AesCtr256) {
+    let dc_bytes = dc_idx.to_le_bytes();
+    let proto_tag = PROTO_TAG_INTERMEDIATE;
+
+    loop {
+        let mut handshake = [0u8; HANDSHAKE_LEN];
+        rand::rng().fill_bytes(&mut handshake);
+
+        if RESERVED_FIRST_BYTES.contains(&handshake[0]) {
+            continue;
+        }
+        if RESERVED_STARTS.iter().any(|start| handshake[..4] == start[..]) {
+            continue;
+        }
+
+        let mut enc = make_cipher(
+            &handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN],
+            &handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN],
+        );
+        // Промотка на длину заголовка: полезная нагрузка начинается с 64-го байта.
+        let mut keystream = [0u8; HANDSHAKE_LEN];
+        enc.apply_keystream(&mut keystream);
+
+        // Шифр от DC: перевёрнутые prekey+IV, без промотки и без хеша.
+        let mut reversed = [0u8; PREKEY_LEN + IV_LEN];
+        reversed.copy_from_slice(
+            &handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN],
+        );
+        reversed.reverse();
+        let dec = make_cipher(&reversed[..PREKEY_LEN], &reversed[PREKEY_LEN..]);
+
+        // Тег (4 байта) и DC (i16 LE) в конце заголовка, остальное — мусор.
+        let mut tail = [0u8; 6];
+        tail[..4].copy_from_slice(&proto_tag);
+        tail[4..].copy_from_slice(&dc_bytes);
+        for (i, byte) in tail.iter().enumerate() {
+            handshake[PROTO_TAG_POS + i] = byte ^ keystream[PROTO_TAG_POS + i];
+        }
 
         return (handshake, enc, dec);
     }
@@ -565,6 +653,198 @@ pub async fn spawn_worker_bridge(worker: String) -> Result<SocketAddr, String> {
     Ok(local)
 }
 
+/// WSS-подключение к воркеру/CF-прокси с заголовком, который они ожидают.
+async fn connect_ws(url: &str, timeout_msg: &str) -> Result<WsStream, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("адрес {url}: {e}"))?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static("binary"),
+    );
+
+    let (ws, response) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| timeout_msg.to_string())?
+    .map_err(|e| format!("WSS {url}: {e}"))?;
+    if std::env::var_os("GORILLA_WS_DEBUG").is_some() {
+        eprintln!("[dbg ws] {url} → {}", response.status());
+    }
+    Ok(ws)
+}
+
+/// Режет исходящий поток на отдельные MTProto-пакеты: CF-прокси и воркер
+/// пересылают каждый WS-фрейм как есть, а DC разбирает поток пакетами.
+struct MsgSplitter {
+    proto: Proto,
+    buf: Vec<u8>,
+    disabled: bool,
+    /// grammers один раз присылает тег 0xeeeeeeee перед первым пакетом —
+    /// он уже объявлен в нашем relay-заголовке, в DC его слать не нужно.
+    drop_tag: bool,
+}
+
+impl MsgSplitter {
+    fn new(proto: Proto) -> Self {
+        Self {
+            proto,
+            buf: Vec::with_capacity(16 * 1024),
+            disabled: false,
+            drop_tag: true,
+        }
+    }
+
+    fn split(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        if self.disabled {
+            return vec![chunk.to_vec()];
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        if self.drop_tag && self.buf.len() >= 4 {
+            if self.buf[..4] == PROTO_TAG_INTERMEDIATE[..]
+                || self.buf[..4] == PROTO_TAG_ABRIDGED[..]
+            {
+                self.buf.drain(..4);
+            }
+            self.drop_tag = false;
+        }
+        loop {
+            let Some((header, payload)) = self.peek_len() else {
+                break;
+            };
+            if payload == 0 {
+                self.disabled = true;
+                out.push(self.buf.drain(..).collect::<Vec<u8>>());
+                break;
+            }
+            if self.buf.len() < header + payload {
+                break;
+            }
+            out.push(self.buf.drain(..header + payload).collect::<Vec<u8>>());
+        }
+        out
+    }
+
+    fn peek_len(&self) -> Option<(usize, usize)> {
+        match self.proto {
+            Proto::Intermediate => {
+                if self.buf.len() < 4 {
+                    return None;
+                }
+                let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+                    & 0x7FFF_FFFF;
+                Some((4, len as usize))
+            }
+            Proto::Abridged => {
+                if self.buf.is_empty() {
+                    return None;
+                }
+                if self.buf[0] < 0x7f {
+                    Some((1, self.buf[0] as usize * 4))
+                } else {
+                    if self.buf.len() < 4 {
+                        return None;
+                    }
+                    let word =
+                        u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+                    Some((4, (word >> 8) as usize * 4))
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Option<Vec<u8>> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(self.buf.drain(..).collect())
+        }
+    }
+}
+
+
+/// Двусторонняя пересылка: клиентский сокет ↔ WSS-туннель.
+async fn pump(
+    mut client: TcpStream,
+    ws: WsStream,
+    enc: AesCtr256,
+    dec: AesCtr256,
+    proto: Proto,
+    tag: &str,
+) -> Result<(), String> {
+    let (mut ws_send, mut ws_recv) = ws.split();
+    let (mut from_client, mut to_client) = client.split();
+
+    let up = async {
+        let mut enc = enc;
+        let mut splitter = MsgSplitter::new(proto);
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = from_client
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("клиент→{tag}: {e}"))?;
+            if n == 0 {
+                if let Some(tail) = splitter.flush() {
+                    ws_send
+                        .send(Message::Binary(tail.into()))
+                        .await
+                        .map_err(|e| format!("отправка в {tag}: {e}"))?;
+                }
+                return Ok::<(), String>(());
+            }
+            for part in splitter.split(&buf[..n]) {
+                let mut cipher = part;
+                enc.apply_keystream(&mut cipher);
+                ws_send
+                    .send(Message::Binary(cipher.into()))
+                    .await
+                    .map_err(|e| format!("отправка в {tag}: {e}"))?;
+            }
+        }
+    };
+    let down = async {
+        let mut dec = dec;
+        loop {
+            match ws_recv.next().await {
+                Some(Ok(Message::Binary(bytes))) => {
+                    let mut data = bytes.to_vec();
+                    dec.apply_keystream(&mut data);
+                    to_client
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| format!("{tag}→клиент: {e}"))?;
+                }
+                Some(Ok(Message::Text(text))) => {
+                    to_client
+                        .write_all(text.as_str().as_bytes())
+                        .await
+                        .map_err(|e| format!("{tag}→клиент: {e}"))?;
+                }
+                other => {
+                    if std::env::var_os("GORILLA_WS_DEBUG").is_some() {
+                        eprintln!("[dbg {tag}] вниз: {other:?}");
+                    }
+                    match other {
+                        Some(Ok(Message::Close(_))) | None => return Ok::<(), String>(()),
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(format!("WSS-поток {tag}: {e}")),
+                    }
+                }
+            }
+
+        }
+    };
+
+    tokio::select! {
+        result = up => result,
+        result = down => result,
+    }
+}
+
 /// Одно клиентское подключение через worker: SOCKS5 → WSS → DC.
 async fn serve_worker_client(mut client: TcpStream, worker: &str) -> Result<(), String> {
     let (dst_ip, dc_idx) = socks_accept(&mut client).await?;
@@ -573,59 +853,267 @@ async fn serve_worker_client(mut client: TcpStream, worker: &str) -> Result<(), 
         dc_idx.abs()
     );
 
-    let (ws, _response) = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio_tungstenite::connect_async(&url),
-    )
-    .await
-    .map_err(|_| format!("таймаут WSS-подключения к {worker}"))?
-    .map_err(|e| format!("WSS {worker}: {e}"))?;
+    let mut ws = connect_ws(&url, &format!("таймаут WSS-подключения к {worker}")).await?;
+    let (init, enc, dec) = generate_relay_handshake(dc_idx);
+    ws.send(Message::Binary(init.to_vec().into()))
+        .await
+        .map_err(|e| format!("воркер: рукопожатие: {e}"))?;
+    pump(client, ws, enc, dec, Proto::Intermediate, "воркер").await
+}
 
-    let (mut ws_send, mut ws_recv) = ws.split();
-    let (mut from_client, mut to_client) = client.split();
 
-    let up = async {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = from_client
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("клиент→воркер: {e}"))?;
-            if n == 0 {
-                return Ok::<(), String>(());
-            }
-            ws_send
-                .send(Message::Binary(buf[..n].to_vec().into()))
-                .await
-                .map_err(|e| format!("отправка в воркер: {e}"))?;
+/// Хост CF-прокси для нужного DC: `kws<dc>.<домен>` (так же в tg-ws-proxy).
+fn cf_proxy_host(domain: &str, dc_idx: i16) -> String {
+    format!("kws{}.{domain}", dc_idx.abs())
+}
+
+/// Прогретый WSS-туннель в пуле.
+struct PooledWs {
+    ws: WsStream,
+    created: Instant,
+}
+
+/// Пул готовых туннелей к CF-прокси — как `_CfWorkerPool` в tg-ws-proxy.
+///
+/// Для каждого DC держим заранее поднятый WSS и отдаём его клиенту сразу,
+/// протухший (старше 100 c) меняем в фоне. Так обрыв DPI не превращается
+/// в таймаут TLS-рукопожатия, а grammers переподключается в ту же секунду.
+struct CfProxyPool {
+    idle: Mutex<HashMap<i16, VecDeque<PooledWs>>>,
+    refilling: Mutex<HashSet<i16>>,
+    rotating: Mutex<HashSet<i16>>,
+    /// Домен, который сработал для DC: его пробуем первым (как balancer.py).
+    pinned: Mutex<HashMap<i16, usize>>,
+    failures: Mutex<HashMap<i16, u32>>,
+    retry_after: Mutex<HashMap<i16, Instant>>,
+}
+
+/// Сколько живёт прогретый туннель (в tg-ws-proxy — 100 c).
+const POOL_MAX_AGE: Duration = Duration::from_secs(100);
+/// Как часто проверять живость пула.
+const POOL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Сколько готовых туннелей держим на один DC.
+const POOL_PER_DC: usize = 2;
+
+static CF_POOL: OnceLock<CfProxyPool> = OnceLock::new();
+
+fn pool() -> &'static CfProxyPool {
+    CF_POOL.get_or_init(CfProxyPool::new)
+}
+
+impl CfProxyPool {
+    fn new() -> Self {
+        Self {
+            idle: Mutex::new(HashMap::new()),
+            refilling: Mutex::new(HashSet::new()),
+            rotating: Mutex::new(HashSet::new()),
+            pinned: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+            retry_after: Mutex::new(HashMap::new()),
         }
-    };
-    let down = async {
-        loop {
-            match ws_recv.next().await {
-                Some(Ok(Message::Binary(bytes))) => {
-                    to_client
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|e| format!("воркер→клиент: {e}"))?;
-                }
-                Some(Ok(Message::Text(text))) => {
-                    to_client
-                        .write_all(text.as_str().as_bytes())
-                        .await
-                        .map_err(|e| format!("воркер→клиент: {e}"))?;
-                }
-                Some(Ok(Message::Close(_))) | None => return Ok::<(), String>(()),
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(format!("WSS-поток: {e}")),
-            }
-        }
-    };
-
-    tokio::select! {
-        result = up => result,
-        result = down => result,
     }
+
+    /// Туннель для DC: готовый из пула, иначе — свежий (и сразу пополнить).
+    async fn acquire(self: &'static Self, dc: i16) -> Result<WsStream, String> {
+        let mut taken = None;
+        {
+            let mut idle = self.idle.lock().await;
+            let bucket = idle.entry(dc).or_default();
+            while let Some(entry) = bucket.pop_front() {
+                if entry.created.elapsed() < POOL_MAX_AGE {
+                    taken = Some(entry.ws);
+                    break;
+                }
+            }
+        }
+        self.spawn_refill(dc).await;
+
+        match taken {
+            Some(ws) => {
+                println!("[cf-прокси] DC{dc}: готовый туннель из пула");
+                Ok(ws)
+            }
+            None => {
+                let (ws, host) = self.connect_one(dc).await?;
+                println!("[cf-прокси] DC{dc} через {host}");
+                Ok(ws)
+            }
+        }
+    }
+
+    /// Фоновое пополнение: начинается с первой же потребности в DC.
+    async fn spawn_refill(self: &'static Self, dc: i16) {
+        if let Some(at) = self.retry_after.lock().await.get(&dc).copied() {
+            if at > Instant::now() {
+                return;
+            }
+        }
+        if !self.refilling.lock().await.insert(dc) {
+            return;
+        }
+        self.spawn_rotation(dc).await;
+        tokio::spawn(async move {
+            pool().refill(dc).await;
+        });
+    }
+
+    /// Держит пул живым: раз в 5 c выбрасывает протухшие и дозаправляет.
+    async fn spawn_rotation(self: &'static Self, dc: i16) {
+        if !self.rotating.lock().await.insert(dc) {
+            return;
+        }
+        tokio::spawn(async move {
+            loop {
+                let ready = {
+                    let mut idle = pool().idle.lock().await;
+                    let bucket = idle.entry(dc).or_default();
+                    bucket.retain(|entry| entry.created.elapsed() < POOL_MAX_AGE);
+                    bucket.len()
+                };
+                if ready < POOL_PER_DC {
+                    pool().kick_refill(dc).await;
+                }
+                tokio::time::sleep(POOL_CHECK_INTERVAL).await;
+            }
+        });
+    }
+
+    /// Одна попытка дозаправки без запуска ротации (её уже крутит цикл).
+    async fn kick_refill(self: &'static Self, dc: i16) {
+        if let Some(at) = self.retry_after.lock().await.get(&dc).copied() {
+            if at > Instant::now() {
+                return;
+            }
+        }
+        if !self.refilling.lock().await.insert(dc) {
+            return;
+        }
+        tokio::spawn(async move {
+            pool().refill(dc).await;
+        });
+    }
+
+    /// Пополнить пул до `POOL_PER_DC`; при отказе — пауза с удвоением.
+    async fn refill(&self, dc: i16) {
+        let mut connected = 0u32;
+        loop {
+            let have = self.idle.lock().await.get(&dc).map_or(0, |b| b.len());
+            if have >= POOL_PER_DC {
+                break;
+            }
+            match self.connect_one(dc).await {
+                Ok((ws, _host)) => {
+                    self.idle
+                        .lock()
+                        .await
+                        .entry(dc)
+                        .or_default()
+                        .push_back(PooledWs { ws, created: Instant::now() });
+                    connected += 1;
+                }
+                Err(e) => {
+                    eprintln!("[cf-прокси] пул DC{dc}: {e}");
+                    break;
+                }
+            }
+        }
+
+        self.refilling.lock().await.remove(&dc);
+        let mut failures = self.failures.lock().await;
+        let mut retry = self.retry_after.lock().await;
+        if connected > 0 {
+            failures.remove(&dc);
+            retry.remove(&dc);
+            println!("[cf-прокси] пул DC{dc}: {connected} готовых туннелей");
+        } else {
+            let n = {
+                let n = failures.entry(dc).or_insert(0);
+                *n += 1;
+                *n
+            };
+            let delay = 2f64.powi((n - 1).min(12) as i32).min(3600.0);
+            retry.insert(dc, Instant::now() + Duration::from_secs_f64(delay));
+            println!("[cf-прокси] пул DC{dc} пуст, следующая попытка через {delay:.0} c");
+        }
+    }
+
+    /// Подключение к CF-прокси для DC, начиная с закреплённого домена.
+    async fn connect_one(&self, dc: i16) -> Result<(WsStream, String), String> {
+        let count = CF_PROXY_DOMAINS.len();
+        let start = *self.pinned.lock().await.get(&dc).unwrap_or(&0) % count;
+        let mut last_err = String::new();
+
+        for step in 0..count {
+            let idx = (start + step) % count;
+            let host = cf_proxy_host(CF_PROXY_DOMAINS[idx], dc);
+            let url = format!("wss://{host}/apiws");
+            match connect_ws(&url, &format!("таймаут WSS-подключения к {host}")).await {
+                Ok(ws) => {
+                    self.pinned.lock().await.insert(dc, idx);
+                    return Ok((ws, host));
+                }
+                Err(e) => {
+                    eprintln!("[cf-прокси] {host}: {e}");
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(format!(
+            "ни один стандартный CF-прокси не ответил для DC{dc}: {last_err}"
+        ))
+    }
+}
+
+/// Локальный SOCKS5-мост через стандартные CF-прокси tg-ws-proxy:
+/// `wss://kws<dc>.<домен>/apiws` — домен сам знает DC, свой воркер не нужен.
+/// Используется, когда `mtproxy.worker` не задан.
+pub async fn spawn_cfproxy_bridge() -> Result<SocketAddr, String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("не удалось занять локальный порт под мост: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("адрес моста: {e}"))?;
+
+    println!(
+        "[cf-прокси] локальный SOCKS5: {local} → {} стандартных доменов tg-ws-proxy, пул прогретых туннелей",
+        CF_PROXY_DOMAINS.len()
+    );
+
+    // Прогреваем туннель к первому DC: к первому подключению grammers он уже готов.
+    tokio::spawn(async { pool().spawn_refill(2).await });
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_cfproxy_client(stream).await {
+                            eprintln!("[cf-прокси] соединение закрыто: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[cf-прокси] приём подключений: {e}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    Ok(local)
+}
+
+/// Одно клиентское подключение через стандартный CF-прокси: SOCKS5 → WSS → DC.
+async fn serve_cfproxy_client(mut client: TcpStream) -> Result<(), String> {
+    let (_dst_ip, dc_idx) = socks_accept(&mut client).await?;
+    let mut ws = pool().acquire(dc_idx.abs()).await?;
+    let (init, enc, dec) = generate_relay_handshake(dc_idx);
+    ws.send(Message::Binary(init.to_vec().into()))
+        .await
+        .map_err(|e| format!("cf-прокси: рукопожатие: {e}"))?;
+    pump(client, ws, enc, dec, Proto::Intermediate, "cf-прокси").await
 }
 
 async fn serve_client(mut client: TcpStream, target: &Target) -> Result<(), String> {

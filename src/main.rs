@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 //! gorilla-bot — автоигра в казино Bot Gorilla в Telegram (мартингейл).
 //!
 //! Режимы (передаются первым аргументом):
@@ -11,15 +16,16 @@ mod config;
 mod engine;
 mod gui;
 mod mtproxy;
+mod profile;
+mod race;
 
-use std::io::{self, BufRead as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use casino::{Martingale, Outcome};
-use config::{CasinoConfig, Config};
+use config::{CasinoConfig, Config, WsTunnel};
 use grammers_client::client::UpdateStream;
 use grammers_client::peer::Peer;
 use grammers_client::sender::{ConnectionParams, SenderPool, SenderPoolFatHandle, UpdatesConfiguration};
@@ -29,7 +35,7 @@ use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
-use grammers_client::{Client, SignInError};
+use grammers_client::Client;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -41,13 +47,30 @@ static NO_CANCEL: AtomicBool = AtomicBool::new(false);
 const SCAN_FILE: &str = "gorilla_scan.txt";
 const LOG_FILE: &str = "gorilla_log.txt";
 
-/// Файлы данных (сессия, логи, скан) лежат рядом с config.json, а не в текущей папке.
+/// Папка данных — рядом с exe/config.json, а не в текущей папке.
 pub(crate) static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub(crate) fn data_path(name: &str) -> PathBuf {
     match DATA_DIR.get() {
         Some(dir) => dir.join(name),
         None => PathBuf::from(name),
+    }
+}
+
+/// Папка tdata рядом с программой: там живёт сессия Telegram.
+pub(crate) fn tdata_path() -> PathBuf {
+    data_path("tdata")
+}
+
+/// Путь к файлу сессии внутри tdata (папка создаётся сразу).
+pub(crate) fn session_path(name: &str) -> PathBuf {
+    let dir = tdata_path();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = Path::new(name);
+    if path.components().count() > 1 || path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        dir.join(path)
     }
 }
 
@@ -81,12 +104,13 @@ async fn run_cli(mode: String) {
     let _ = DATA_DIR.set(cfg.base_dir.clone());
 
     let result = match mode.as_str() {
-        "login" => login(&cfg).await,
         "scan" => scan(&cfg).await,
         "balance" => balance(&cfg).await,
         "pet" => pet_mode(&cfg).await,
+        "printer" => printer_mode(&cfg).await,
         "bonus" => bonus_mode(&cfg).await,
         "casino" => casino_mode(&cfg).await,
+        "race" => race_mode(&cfg).await,
         "check" => check(&cfg).await,
         "probe" => probe_mode(&cfg).await,
         other => {
@@ -109,11 +133,53 @@ fn print_usage() {
          \x20 scan [N] — последние N сообщений с ботом → {SCAN_FILE} (по умолчанию 60)\n\
          \x20 balance  — запросить у бота баланс и показать ответ\n\
          \x20 pet      — «Питомец поход», при просьбе покормить — покормить и повторить\n\
+         \x20 printer  — «Принтер», заправка и снятие денег по порогу\n\
          \x20 bonus    — отправить «Бонус» в чат из bonus.target (проверка)\n\
+         \x20 race     — «Гонка»: техосмотр, заезд и ожидание финиша\n\
          \x20 casino   — авто-казино: ставка растёт после проигрыша, сброс после выигрыша\n\
          \x20 check    — проверить канал связи (MTProto-прокси/SOCKS5), без логина"
     );
 }
+
+/// Маршрут подключения: свой воркер → стандартные CF-прокси tg-ws-proxy →
+/// MTProto-прокси → внешний SOCKS5 → прямое (`None`). Поднимает мост
+/// (локальный SOCKS5) и возвращает его адрес для grammers.
+async fn local_proxy_url(cfg: &Config) -> Result<Option<String>, BoxError> {
+    match cfg.mtproxy.ws_tunnel() {
+        Some(WsTunnel::Worker(worker)) => {
+            // Cloudflare-worker: WSS-труба прямо к DC, DPI её не видит.
+            let local = mtproxy::spawn_worker_bridge(worker).await?;
+            Ok(Some(format!("socks5://{local}")))
+        }
+        Some(WsTunnel::Defaults) => {
+            // Свой воркер не задан — стандартные CF-прокси из tg-ws-proxy.
+            let local = mtproxy::spawn_cfproxy_bridge().await?;
+            Ok(Some(format!("socks5://{local}")))
+        }
+        None if !cfg.mtproxy.secret.trim().is_empty() => {
+            // Встроенный мост: локальный SOCKS5 → настоящий MTProto-прокси.
+            let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
+            let target = std::net::SocketAddr::new(
+                cfg.mtproxy
+                    .host
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
+                cfg.mtproxy.port,
+            );
+            let local = mtproxy::spawn_socks_bridge(target, secret).await?;
+            Ok(Some(format!("socks5://{local}")))
+        }
+        None => Ok(cfg.proxy.clone().filter(|p| !p.trim().is_empty())),
+    }
+}
+
+/// Транспорт intermediate (0xee) нужен для любого моста: WSS-туннель или
+/// obfuscated2-прокси из конфига.
+fn intermediates(cfg: &Config) -> bool {
+    cfg.mtproxy.ws_tunnel().is_some() || !cfg.mtproxy.secret.trim().is_empty()
+}
+
 
 /// Подключение: открывает сессию, поднимает пул, проверяет авторизацию.
 pub(crate) async fn connect(
@@ -121,49 +187,22 @@ pub(crate) async fn connect(
     allow_unauthorized: bool,
 ) -> Result<(Client, mpsc::Receiver<UpdatesLike>, SenderPoolFatHandle, JoinHandle<()>), BoxError>
 {
-    let session_path = data_path(&cfg.session_file);
+    let session_path = session_path(&cfg.session_file);
     let session = Arc::new(
         SqliteSession::open(&session_path)
             .await
             .map_err(|e| format!("не удалось открыть {}: {e}", session_path.display()))?,
     );
 
-    let proxy_url = if !cfg.mtproxy.worker.trim().is_empty() {
-        // Cloudflare-worker: WSS-труба прямо к DC, DPI её не видит.
-        let local = mtproxy::spawn_worker_bridge(cfg.mtproxy.worker.trim().to_string()).await?;
-        Some(format!("socks5://{local}"))
-    } else if !cfg.mtproxy.secret.trim().is_empty() {
-        // Встроенный мост: локальный SOCKS5 → настоящий MTProto-прокси.
-        let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
-        let target = std::net::SocketAddr::new(
-            cfg.mtproxy
-                .host
-                .trim()
-                .parse()
-                .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
-            cfg.mtproxy.port,
-        );
-        let local = mtproxy::spawn_socks_bridge(target, secret).await?;
-        Some(format!("socks5://{local}"))
-    } else if cfg
-        .proxy
-        .as_deref()
-        .is_some_and(|p| !p.trim().is_empty())
-    {
-        cfg.proxy.clone()
-    } else {
-        None
-    };
+    let proxy_url = local_proxy_url(cfg).await?;
     let params = ConnectionParams {
         proxy_url,
-        transport: if cfg.mtproxy.worker.trim().is_empty()
-            && cfg.mtproxy.secret.trim().is_empty()
-        {
-            // Прямое подключение/внешний SOCKS: обычный «Full»-транспорт.
-            Box::new(|| Box::new(grammers_mtproto::transport::Full::new()))
-        } else {
+        transport: if intermediates(cfg) {
             // Мост рассчитан на intermediate-кадровку (0xee).
             Box::new(|| Box::new(Intermediate::new()))
+        } else {
+            // Прямое подключение/внешний SOCKS: обычный «Full»-транспорт.
+            Box::new(|| Box::new(grammers_mtproto::transport::Full::new()))
         },
         ..Default::default()
     };
@@ -179,7 +218,7 @@ pub(crate) async fn connect(
 
     if !allow_unauthorized && !client.is_authorized().await? {
         return Err(format!(
-            "нет активной сессии в {} — сначала сделай `gorilla-bot login`",
+            "нет активной сессии в {} — войди в Telegram на вкладке «Telegram»",
             session_path.display()
         )
         .into());
@@ -211,38 +250,16 @@ async fn probe_mode(cfg: &Config) -> Result<(), BoxError> {
 /// настоящий MTProto-обмен (генерация ключа авторизации) с DC2 —
 /// без входа и без отправки кода на телефон.
 async fn check(cfg: &Config) -> Result<(), BoxError> {
-    let proxy_url = if !cfg.mtproxy.worker.trim().is_empty() {
-        let local = mtproxy::spawn_worker_bridge(cfg.mtproxy.worker.trim().to_string()).await?;
-        format!("socks5://{local}")
-    } else if !cfg.mtproxy.secret.trim().is_empty() {
-        let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
-        let target = std::net::SocketAddr::new(
-            cfg.mtproxy
-                .host
-                .trim()
-                .parse()
-                .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
-            cfg.mtproxy.port,
-        );
-        let local = mtproxy::spawn_socks_bridge(target, secret).await?;
-        format!("socks5://{local}")
-    } else if let Some(p) = cfg
-        .proxy
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-    {
-        p.to_string()
-    } else {
+    let proxy_url = local_proxy_url(cfg).await?.unwrap_or_default();
+    if proxy_url.is_empty() {
         println!("Прямое подключение (прокси не настроен).");
-        String::new()
-    };
+    }
 
     // Main-адрес DC2: мост сначала пробует main-маршрут, потом медиа.
     // Через worker — IP передаётся воркеру как dst (там он же и открывается).
-    let dc2: std::net::SocketAddr = if cfg.mtproxy.worker.trim().is_empty() {
-        "149.154.167.50:443".parse().unwrap()
-    } else {
-        "149.154.167.51:443".parse().unwrap()
+    let dc2: std::net::SocketAddr = match cfg.mtproxy.ws_tunnel() {
+        Some(WsTunnel::Worker(_)) => "149.154.167.51:443".parse().unwrap(),
+        _ => "149.154.167.50:443".parse().unwrap(),
     };
     let addr = if proxy_url.is_empty() {
         ServerAddr::Tcp { address: dc2 }
@@ -255,8 +272,7 @@ async fn check(cfg: &Config) -> Result<(), BoxError> {
 
     // Живой сокет — лотерея (мост сам делает редайалы до первого кадра,
     // но обрывы возможны и середине DH), поэтому несколько попыток.
-    let use_intermediate =
-        !cfg.mtproxy.worker.trim().is_empty() || !cfg.mtproxy.secret.trim().is_empty();
+    let use_intermediate = intermediates(cfg);
     let mut last_err = String::new();
     let mut ok = false;
     for attempt in 1..=3u32 {
@@ -290,16 +306,6 @@ async fn check(cfg: &Config) -> Result<(), BoxError> {
         eprintln!("❌ Канал не работает: {last_err}");
         Err("проверка канала не прошла".into())
     }
-}
-
-/// Читает строку с клавиатуры (для интерактивного логина).
-fn prompt(message: &str) -> io::Result<String> {
-    let mut out = io::stdout().lock();
-    out.write_all(message.as_bytes())?;
-    out.flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    Ok(line)
 }
 
 /// Находит бота по username и возвращает его (Peer, PeerRef).
@@ -414,52 +420,6 @@ async fn bonus_mode(cfg: &Config) -> Result<(), BoxError> {
 }
 
 /// `run login`: вход по телефону и коду (или паролю 2FA), сессия сохраняется в файл.
-async fn login(cfg: &Config) -> Result<(), BoxError> {
-    let (client, _updates, handle, pool_task) = connect(cfg, true).await?;
-
-    if client.is_authorized().await? {
-        println!("Сессия уже активна, повторный вход не нужен.");
-    } else {
-        let phone = if cfg.phone.trim().is_empty() || cfg.phone.trim() == "+" {
-            prompt("Телефон в формате +79991234567: ")?.trim().to_string()
-        } else {
-            cfg.phone.trim().to_string()
-        };
-
-        let token = client
-            .request_login_code(&phone, &cfg.api_hash)
-            .await
-            .map_err(|e| format!("не удалось отправить код на {phone}: {e}"))?;
-        println!("Код отправлен, проверь Telegram (или SMS).");
-
-        let code = prompt("Код из Telegram: ")?;
-        match client.sign_in(&token, code.trim()).await {
-            Ok(_) => {}
-            Err(SignInError::PasswordRequired(password_token)) => {
-                let hint = password_token.hint().unwrap_or("нет подсказки");
-                let password = prompt(&format!("Пароль 2FA (подсказка: {hint}): "))?;
-                client
-                    .check_password(password_token, password.trim())
-                    .await
-                    .map_err(|e| format!("неверный пароль 2FA: {e}"))?;
-            }
-            Err(e) => return Err(format!("вход не удался: {e}").into()),
-        }
-    }
-
-    let me = client.get_me().await?;
-    println!(
-        "Готово, {}! Сессия сохранена в {}.",
-        me.first_name().unwrap_or("?"),
-        data_path(&cfg.session_file).display()
-    );
-
-    handle.quit();
-    let _ = pool_task.await;
-    Ok(())
-}
-
-/// `run scan [N]`: выгружает историю чата с ботом в gorilla_scan.txt (старые сверху).
 async fn scan(cfg: &Config) -> Result<(), BoxError> {
     let count: usize = std::env::args()
         .nth(2)
@@ -542,6 +502,144 @@ async fn pet_mode(cfg: &Config) -> Result<(), BoxError> {
             )
             .await?;
         }
+    }
+
+    handle.quit();
+    let _ = pool_task.await;
+    Ok(())
+}
+
+/// `run race`: одна гонка из CLI.
+async fn race_mode(cfg: &Config) -> Result<(), BoxError> {
+    let (client, _updates, handle, pool_task) = connect(cfg, false).await?;
+    let (bot, bot_ref) = resolve_bot(&client, &cfg.bot_username).await?;
+    let bot_id = bot.id();
+
+    let mut win = false;
+    let mut after_id;
+    for _ in 0..4 {
+        let sent = client.send_message(bot_ref, &cfg.race.command).await?;
+        println!("Отправлено: «{}»", cfg.race.command);
+        after_id = sent.id();
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(cfg.race.reply_timeout_secs);
+        let mut none: Option<UpdateStream> = None;
+        let waited = wait_reply(
+            &client, &mut none, bot_ref, bot_id, after_id, deadline, &NO_CANCEL, false,
+        )
+        .await?;
+        let reply = match waited {
+            Wait::Reply(id, text) => {
+                after_id = id;
+                println!("{}", text.trim());
+                text
+            }
+            Wait::Timeout => {
+                println!("Бот не ответил.");
+                break;
+            }
+            Wait::Cancelled => break,
+        };
+        match race::parse_reply(&reply) {
+            race::RaceReply::Inspection(secs) => {
+                let pause = secs + cfg.race.cooldown_margin_secs;
+                println!(
+                    "Техосмотр: ждём {} мин {} сек.",
+                    pause / 60,
+                    pause % 60
+                );
+                tokio::time::sleep(Duration::from_secs(pause)).await;
+            }
+            race::RaceReply::Started => {
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(cfg.race.result_timeout_secs);
+                let mut none: Option<UpdateStream> = None;
+                let waited = wait_reply(
+                    &client, &mut none, bot_ref, bot_id, after_id, deadline, &NO_CANCEL, false,
+                )
+                .await?;
+                match waited {
+                    Wait::Reply(_, text) => {
+                        println!("{}", text.trim());
+                        if let race::RaceReply::Finish { win: w, .. } = race::parse_reply(&text) {
+                            win = w;
+                        }
+                    }
+                    _ => println!("Результат не пришёл."),
+                }
+                break;
+            }
+            race::RaceReply::Finish { win: w, .. } => {
+                win = w;
+                break;
+            }
+            race::RaceReply::Unknown => break,
+        }
+    }
+    println!("Итог: {}", if win { "победа" } else { "без победы" });
+
+    handle.quit();
+    let _ = pool_task.await;
+    Ok(())
+}
+
+/// `run printer`: проверяет принтер, заправляет и снимает деньги.
+async fn printer_mode(cfg: &Config) -> Result<(), BoxError> {
+    let (client, _updates, handle, pool_task) = connect(cfg, false).await?;
+    let (bot, bot_ref) = resolve_bot(&client, &cfg.bot_username).await?;
+    let bot_id = bot.id();
+
+    let Some(text) = pet_cmd(
+        &client,
+        bot_ref,
+        bot_id,
+        cfg.printer.command.trim(),
+        cfg.printer.reply_timeout_secs,
+    )
+    .await?
+    else {
+        handle.quit();
+        let _ = pool_task.await;
+        return Ok(());
+    };
+
+    let info = engine::parse_printer_info(&text);
+    let lower = text.to_lowercase();
+    let broken_or_jammed = lower.contains("слом") || lower.contains("заклин");
+
+    let need_refill = cfg.printer.auto_refill
+        && !cfg.printer.refill_command.trim().is_empty()
+        && match info.cartridge_pct {
+            Some(pct) => pct <= cfg.printer.refill_below_percent.min(100) && pct < 100,
+            None => broken_or_jammed,
+        };
+
+    if need_refill {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        pet_cmd(
+            &client,
+            bot_ref,
+            bot_id,
+            cfg.printer.refill_command.trim(),
+            cfg.printer.reply_timeout_secs,
+        )
+        .await?;
+    }
+
+    let need_withdraw = cfg.printer.auto_withdraw
+        && !cfg.printer.withdraw_command.trim().is_empty()
+        && info.can_withdraw.map_or(false, |amt| amt > 0);
+
+    if need_withdraw {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        pet_cmd(
+            &client,
+            bot_ref,
+            bot_id,
+            cfg.printer.withdraw_command.trim(),
+            cfg.printer.reply_timeout_secs,
+        )
+        .await?;
     }
 
     handle.quit();
@@ -911,7 +1009,7 @@ pub(crate) async fn wait_reply(
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return Ok(Wait::Timeout),
             _ = poll.tick() => {
-                if let Some((id, text)) = latest_reply(client, bot_ref, after_id).await? {
+                if let Some((id, text)) = latest_reply(client, bot_ref, after_id, bot_id).await? {
                     if skip_noise && is_chat_noise(&text) {
                         continue;
                     }
@@ -920,7 +1018,10 @@ pub(crate) async fn wait_reply(
             }
             update = next_update(stream) => match update {
                 Ok(Update::NewMessage(msg))
-                    if !msg.outgoing() && msg.id() > after_id && msg.peer_id() == bot_id =>
+                    if !msg.outgoing()
+                        && msg.id() > after_id
+                        && msg.peer_id() == bot_ref.id
+                        && msg.sender_id() == Some(bot_id) =>
                 {
                     let text = msg.text().trim().to_string();
                     if skip_noise && is_chat_noise(&text) {
@@ -947,6 +1048,8 @@ pub(crate) fn is_chat_noise(text: &str) -> bool {
         || lower.contains("питомца")
         || lower.contains("поход")
         || lower.contains("приглашай друзей")
+        || lower.contains("принтер")
+        || lower.contains("картридж")
 }
 
 /// Следующее обновление; если поток уже снят — ждём вечно (select игнорирует ветку).
@@ -959,17 +1062,18 @@ async fn next_update(
     }
 }
 
-/// Последнее сообщение бота с id > after_id, найденное в истории чата.
+/// Последнее сообщение от заданного отправителя с id > after_id, найденное в истории чата.
 pub(crate) async fn latest_reply(
     client: &Client,
     bot_ref: PeerRef,
     after_id: i32,
+    sender_id: PeerId,
 ) -> Result<Option<(i32, String)>, BoxError> {
     let mut best: Option<(i32, String)> = None;
     {
         let mut iter = client.iter_messages(bot_ref).limit(8);
         while let Some(msg) = iter.next().await? {
-            if msg.outgoing() || msg.id() <= after_id {
+            if msg.outgoing() || msg.id() <= after_id || msg.sender_id() != Some(sender_id) {
                 continue;
             }
             let text = msg.text().trim().to_string();
@@ -984,6 +1088,7 @@ pub(crate) async fn latest_reply(
     Ok(best)
 }
 
+
 /// Первая непустая строка ответа бота — для консоли (полный текст уходит в лог).
 pub(crate) fn one_line(text: &str) -> String {
     text.lines()
@@ -996,6 +1101,7 @@ pub(crate) fn one_line(text: &str) -> String {
 /// Дописывает строку в gorilla_log.txt с unix-временем.
 pub(crate) fn append_log(line: &str) -> Result<(), BoxError> {
     use std::fs::OpenOptions;
+    use std::io::Write as _;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

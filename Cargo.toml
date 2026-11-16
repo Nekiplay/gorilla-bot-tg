@@ -21,3 +21,38 @@ futures-util = { version = "0.3.34", features = ["sink"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
 time = { version = "0.3", features = ["local-offset"] }
+# Иконка: логотип-исходник в PNG, на старте разбираем в RGBA.
+image = { version = "0.25", default-features = false, features = ["png"] }
+winicon = { path = "crates/winicon" }
+
+# Иконка и блок версии в exe; на не-Windows компилируется в no-op.
+[build-dependencies]
+# Многоразмерный .ico для exe собирается из assets/logo.png на этапе сборки.
+image = { version = "0.25", default-features = false, features = ["png"] }
+winicon = { path = "crates/winicon" }
+
+# Поля, которые winres пишет в ресурс версии exe.
+[package.metadata.winres]
+FileDescription = "gorilla-bot"
+OriginalFilename = "gorilla-bot.exe"
+ProductName = "Gorilla Bot"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+panic = "abort"
+debug = false
+incremental = false
+rpath = false
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

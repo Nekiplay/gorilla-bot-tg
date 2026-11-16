@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use grammers_client::client::UpdateStream;
+use grammers_client::client::{LoginToken, PasswordToken, SignInError, UpdateStream};
 use grammers_client::sender::SenderPoolFatHandle;
 use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
@@ -19,6 +19,8 @@ use tokio::task::JoinHandle;
 
 use crate::casino::{self, Martingale, Outcome};
 use crate::config::Config;
+use crate::profile::{self, Profile};
+use crate::race::{self, RaceReply};
 use crate::{append_log, data_path, one_line, resolve_chat, wait_reply, Wait, BoxError};
 
 /// Файл с временем последней отправки питомца.
@@ -35,10 +37,38 @@ type Conn = (
     JoinHandle<()>,
 );
 
+/// Этап входа в Telegram. Вход живёт в GUI: консоль у релизной сборки
+/// недоступна, поэтому код и пароль вводятся в окне.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LoginStage {
+    /// Ничего не происходит: показываем кнопку «Отправить код».
+    #[default]
+    Idle,
+    /// Код уже отправлен, ждём его ввода.
+    AwaitingCode,
+    /// Аккаунт с 2FA: нужен пароль (в строке — подсказка от Telegram).
+    AwaitingPassword(String),
+    /// Вошли, в строке — имя аккаунта.
+    Done(String),
+    /// Не вышло, в строке — человеческая причина.
+    Failed(String),
+}
+
+/// Открытое соединение на время входа: держим его, пока пользователь вводит
+/// код, иначе `phone_code_hash` станет недействительным.
+struct LoginConn {
+    client: Client,
+    conn: Conn,
+    token: Option<LoginToken>,
+    password: Option<PasswordToken>,
+}
+
 /// Что показать в окне (обновляет движок).
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     pub connected: bool,
+    /// Сессия в tdata авторизована (можно работать без входа).
+    pub authorized: bool,
     pub casino_running: bool,
     pub rounds: u64,
     pub wins: u64,
@@ -54,10 +84,30 @@ pub enum Command {
     StopCasino,
     /// Отправить «Питомец поход» прямо сейчас.
     PetNow,
+    /// Обслужить принтер прямо сейчас («Принтер» + заправить + снять).
+    PrinterNow,
+    /// Отправить «Принтер заправить» прямо сейчас.
+    PrinterRefillNow,
+    /// Отправить «Принтер снять» прямо сейчас.
+    PrinterWithdrawNow,
     /// Отправить «Бонус» в настроенный чат прямо сейчас.
     BonusNow,
     /// Отправить «Бонус» в личку бота прямо сейчас.
     BonusDmNow,
+    /// Отправить «Гонку» прямо сейчас.
+    RaceNow,
+    /// Снять доход с бизнеса прямо сейчас.
+    BusinessNow,
+    /// Запросить профиль игрока у бота.
+    ProfileNow,
+    /// Отправить код входа на телефон.
+    LoginRequest { phone: String },
+    /// Проверить введённый код из Telegram.
+    LoginCode { code: String },
+    /// Проверить пароль 2FA.
+    LoginPassword { password: String },
+    /// Прервать вход и закрыть соединение.
+    LoginCancel,
     /// Сохранить новые настройки в рантайме.
     SetConfig(Config),
     Shutdown,
@@ -76,10 +126,33 @@ pub struct Shared {
     pet_forced: AtomicBool,
     last_pet: Mutex<Option<i64>>,
     next_pet: Mutex<Option<i64>>,
+    printer_wake: Notify,
+    printer_forced: AtomicBool,
+    printer_refill_forced: AtomicBool,
+    printer_withdraw_forced: AtomicBool,
+    last_printer: Mutex<Option<i64>>,
+    next_printer: Mutex<Option<i64>>,
     /// Бонус в канал (t.me/gorillabot_double).
     bonus: BonusSlot,
     /// Бонус в личку бота (цикл ~12 часов).
     bonus_dm: BonusSlot,
+    /// Автоматическая «Гонка» (заезд).
+    race_wake: Notify,
+    race_forced: AtomicBool,
+    last_race: Mutex<Option<i64>>,
+    next_race: Mutex<Option<i64>>,
+    /// Автоснятие дохода с бизнеса.
+    business_wake: Notify,
+    business_forced: AtomicBool,
+    last_business: Mutex<Option<i64>>,
+    next_business: Mutex<Option<i64>>,
+    /// Последний полученный профиль игрока.
+    profile: Mutex<Option<Profile>>,
+    last_profile: Mutex<Option<i64>>,
+    /// Этап входа в Telegram.
+    login: Mutex<LoginStage>,
+    /// Соединение, открытое на время входа.
+    login_conn: AsyncMutex<Option<LoginConn>>,
 }
 
 /// Какой из авто-бонусов: канал или личка бота.
@@ -129,6 +202,37 @@ impl BonusSlot {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BonusReply {
+    Claimed(Option<u64>),
+    Cooldown(u64),
+    Unconfirmed,
+}
+
+/// Accept reward only from a recognizable success response, never arbitrary channel posts.
+fn classify_bonus_reply(text: &str) -> BonusReply {
+    let lower = text.to_lowercase();
+    let delay = parse_bonus_delay(&lower);
+    let has_bonus = lower.contains("бонус");
+    let has_reward = ["$", "₽", "руб", "gb", "💵", "💰", "зачислен", "начислен", "получен", "выдан"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let refusal = ["не удалось", "не получ", "уже получ", "до получения", "получи через", "попробуйте через", "приходите через", "недоступ", "ошибка", "не выполн"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+
+    if has_bonus && has_reward && !refusal {
+        return BonusReply::Claimed(delay);
+    }
+    if has_bonus && refusal {
+        if let Some(secs) = delay {
+            return BonusReply::Cooldown(secs);
+        }
+    }
+    BonusReply::Unconfirmed
+}
+
+
 struct Session {
     chat: Arc<Chat>,
     _conn: Conn,
@@ -150,6 +254,10 @@ struct PersistedState {
     #[serde(default)]
     next_pet_unix: Option<i64>,
     #[serde(default)]
+    last_printer_unix: Option<i64>,
+    #[serde(default)]
+    next_printer_unix: Option<i64>,
+    #[serde(default)]
     last_bonus_unix: Option<i64>,
     #[serde(default)]
     next_bonus_unix: Option<i64>,
@@ -157,6 +265,14 @@ struct PersistedState {
     last_bonus_dm_unix: Option<i64>,
     #[serde(default)]
     next_bonus_dm_unix: Option<i64>,
+    #[serde(default)]
+    last_race_unix: Option<i64>,
+    #[serde(default)]
+    next_race_unix: Option<i64>,
+    #[serde(default)]
+    last_business_unix: Option<i64>,
+    #[serde(default)]
+    next_business_unix: Option<i64>,
 }
 
 /// Интервал до следующего похода с разбросом: interval_secs ± interval_jitter_secs.
@@ -171,6 +287,35 @@ fn pet_interval(cfg: &crate::config::PetConfig) -> i64 {
     secs.max(1)
 }
 
+
+/// Интервал до следующей проверки принтера с разбросом: interval_secs ± interval_jitter_secs.
+fn printer_interval(cfg: &crate::config::PrinterConfig) -> i64 {
+    let base = cfg.interval_secs as i64;
+    let jitter = (cfg.interval_jitter_secs as i64).min(base.max(1));
+    let secs = if jitter > 0 {
+        rand::rng().random_range(base - jitter..=base + jitter)
+    } else {
+        base
+    };
+    secs.max(1)
+}
+
+/// Интервал до следующей гонки с разбросом: interval_secs ± interval_jitter_secs.
+fn race_interval(cfg: &crate::config::RaceConfig) -> i64 {
+    race::interval(cfg)
+}
+
+/// Интервал до следующего «Бизнес снять» с разбросом.
+fn business_interval(cfg: &crate::config::BusinessConfig) -> i64 {
+    let base = cfg.interval_secs as i64;
+    let jitter = (cfg.interval_jitter_secs as i64).min(base.max(1));
+    let secs = if jitter > 0 {
+        rand::rng().random_range((base - jitter).max(1)..=(base + jitter))
+    } else {
+        base
+    };
+    secs.max(1)
+}
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -215,8 +360,26 @@ impl Shared {
             pet_forced: AtomicBool::new(false),
             last_pet: Mutex::new(state.last_pet_unix),
             next_pet: Mutex::new(state.next_pet_unix),
+            printer_wake: Notify::new(),
+            printer_forced: AtomicBool::new(false),
+            printer_refill_forced: AtomicBool::new(false),
+            printer_withdraw_forced: AtomicBool::new(false),
+            last_printer: Mutex::new(state.last_printer_unix),
+            next_printer: Mutex::new(state.next_printer_unix),
             bonus: BonusSlot::new(state.last_bonus_unix, state.next_bonus_unix),
             bonus_dm: BonusSlot::new(state.last_bonus_dm_unix, state.next_bonus_dm_unix),
+            race_wake: Notify::new(),
+            race_forced: AtomicBool::new(false),
+            last_race: Mutex::new(state.last_race_unix),
+            next_race: Mutex::new(state.next_race_unix),
+            business_wake: Notify::new(),
+            business_forced: AtomicBool::new(false),
+            last_business: Mutex::new(state.last_business_unix),
+            next_business: Mutex::new(state.next_business_unix),
+            profile: Mutex::new(None),
+            last_profile: Mutex::new(None),
+            login: Mutex::new(LoginStage::Idle),
+            login_conn: AsyncMutex::new(None),
         })
     }
 
@@ -236,6 +399,26 @@ impl Shared {
     pub fn set_status(&self, f: impl FnOnce(&mut Status)) {
         let mut guard = self.status.lock().unwrap();
         f(&mut guard);
+    }
+
+    /// Текущий этап входа в Telegram.
+    pub fn login_stage(&self) -> LoginStage {
+        self.login.lock().unwrap().clone()
+    }
+
+    fn set_login(&self, stage: LoginStage) {
+        {
+            let mut guard = self.login.lock().unwrap();
+            *guard = stage.clone();
+        }
+        match stage {
+            LoginStage::AwaitingCode => self.log("[вход] код отправлен, введи его в окне"),
+            LoginStage::AwaitingPassword(_) => self.log("[вход] нужен пароль 2FA"),
+            LoginStage::Done(_) => {
+                self.set_status(|s| s.authorized = true);
+            }
+            _ => {}
+        }
     }
 
     pub fn logs(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
@@ -273,10 +456,16 @@ impl Shared {
         let state = PersistedState {
             last_pet_unix: *self.last_pet.lock().unwrap(),
             next_pet_unix: *self.next_pet.lock().unwrap(),
+            last_printer_unix: *self.last_printer.lock().unwrap(),
+            next_printer_unix: *self.next_printer.lock().unwrap(),
             last_bonus_unix: *self.bonus.last.lock().unwrap(),
             next_bonus_unix: *self.bonus.next.lock().unwrap(),
             last_bonus_dm_unix: *self.bonus_dm.last.lock().unwrap(),
             next_bonus_dm_unix: *self.bonus_dm.next.lock().unwrap(),
+            last_race_unix: *self.last_race.lock().unwrap(),
+            next_race_unix: *self.next_race.lock().unwrap(),
+            last_business_unix: *self.last_business.lock().unwrap(),
+            next_business_unix: *self.next_business.lock().unwrap(),
         };
         if let Err(e) = save_state(&state) {
             self.log(format!("[состояние] не удалось сохранить время: {e}"));
@@ -385,6 +574,156 @@ impl Shared {
         Some(Duration::from_secs((due - now_unix()).max(0) as u64))
     }
 
+    pub fn last_printer(&self) -> Option<i64> {
+        *self.last_printer.lock().unwrap()
+    }
+
+    fn set_last_printer(&self, ts: i64) {
+        let cfg = self.cfg();
+        let next = ts + printer_interval(&cfg.printer);
+        *self.last_printer.lock().unwrap() = Some(ts);
+        *self.next_printer.lock().unwrap() = Some(next);
+        self.persist();
+    }
+
+    fn set_next_printer(&self, ts: i64) {
+        *self.next_printer.lock().unwrap() = Some(ts);
+        self.persist();
+    }
+
+    pub fn next_printer_at(&self) -> Option<i64> {
+        *self.next_printer.lock().unwrap()
+    }
+
+    fn reschedule_printer(&self) {
+        let Some(last) = self.last_printer() else {
+            return;
+        };
+        let cfg = self.cfg();
+        *self.next_printer.lock().unwrap() = Some(last + printer_interval(&cfg.printer));
+    }
+
+    /// Через сколько проверять принтер. `None` — авто-принтер выключен.
+    pub fn next_printer_in(&self) -> Option<Duration> {
+        let cfg = self.cfg();
+        if !cfg.printer.enabled {
+            return None;
+        }
+        let due = match self.next_printer_at() {
+            Some(ts) => ts,
+            None => match self.last_printer() {
+                Some(ts) => ts + cfg.printer.interval_secs as i64,
+                None => now_unix(),
+            },
+        };
+        Some(Duration::from_secs((due - now_unix()).max(0) as u64))
+    }
+
+    pub fn last_race(&self) -> Option<i64> {
+        *self.last_race.lock().unwrap()
+    }
+
+    fn set_last_race(&self, ts: i64) {
+        let cfg = self.cfg();
+        let next = ts + race_interval(&cfg.race);
+        *self.last_race.lock().unwrap() = Some(ts);
+        *self.next_race.lock().unwrap() = Some(next);
+        self.persist();
+    }
+
+    fn set_next_race(&self, ts: i64) {
+        *self.next_race.lock().unwrap() = Some(ts);
+        self.persist();
+    }
+
+    pub fn next_race_at(&self) -> Option<i64> {
+        *self.next_race.lock().unwrap()
+    }
+
+    fn reschedule_race(&self) {
+        let Some(last) = self.last_race() else {
+            return;
+        };
+        let cfg = self.cfg();
+        *self.next_race.lock().unwrap() = Some(last + race_interval(&cfg.race));
+    }
+
+    /// Через сколько ехать на гонку. `None` — авто-гонка выключена.
+    pub fn next_race_in(&self) -> Option<Duration> {
+        let cfg = self.cfg();
+        if !cfg.race.enabled {
+            return None;
+        }
+        let due = match self.next_race_at() {
+            Some(ts) => ts,
+            None => match self.last_race() {
+                Some(ts) => ts + cfg.race.interval_secs as i64,
+                None => now_unix(),
+            },
+        };
+        Some(Duration::from_secs((due - now_unix()).max(0) as u64))
+    }
+    pub fn last_business(&self) -> Option<i64> {
+        *self.last_business.lock().unwrap()
+    }
+
+    fn set_last_business(&self, ts: i64) {
+        let cfg = self.cfg();
+        let next = ts + business_interval(&cfg.business);
+        *self.last_business.lock().unwrap() = Some(ts);
+        *self.next_business.lock().unwrap() = Some(next);
+        self.persist();
+    }
+
+    fn set_next_business(&self, ts: i64) {
+        *self.next_business.lock().unwrap() = Some(ts);
+        self.persist();
+    }
+
+    pub fn next_business_at(&self) -> Option<i64> {
+        *self.next_business.lock().unwrap()
+    }
+
+    fn reschedule_business(&self) {
+        let Some(last) = self.last_business() else {
+            return;
+        };
+        let cfg = self.cfg();
+        *self.next_business.lock().unwrap() = Some(last + business_interval(&cfg.business));
+    }
+
+    /// Через сколько снимать бизнес. `None` — автоснятие выключено.
+    pub fn next_business_in(&self) -> Option<Duration> {
+        let cfg = self.cfg();
+        if !cfg.business.enabled {
+            return None;
+        }
+        let due = match self.next_business_at() {
+            Some(ts) => ts,
+            None => match self.last_business() {
+                Some(ts) => ts + cfg.business.interval_secs as i64,
+                None => now_unix(),
+            },
+        };
+        Some(Duration::from_secs((due - now_unix()).max(0) as u64))
+    }
+
+    /// Последний профиль, полученный от бота.
+    pub fn profile(&self) -> Option<Profile> {
+        self.profile.lock().unwrap().clone()
+    }
+
+    /// Когда профиль обновляли в последний раз.
+    pub fn last_profile(&self) -> Option<i64> {
+        *self.last_profile.lock().unwrap()
+    }
+
+    fn set_profile(&self, profile: Profile) {
+        *self.profile.lock().unwrap() = Some(profile);
+        *self.last_profile.lock().unwrap() = Some(now_unix());
+    }
+
+
     /// Подключение (или переиспользование) чата с ботом.
     pub(crate) async fn chat(&self) -> Result<Arc<Chat>, BoxError> {
         let mut guard = self.chat_conn.lock().await;
@@ -413,6 +752,7 @@ impl Shared {
         });
         self.set_status(|s| {
             s.connected = true;
+            s.authorized = true;
             s.message = format!("подключено, @{}", cfg.bot_username);
         });
         self.log(format!("[связь] подключено к @{}", cfg.bot_username));
@@ -434,6 +774,146 @@ impl Shared {
     }
 }
 
+/// Шаг 1: открыть соединение и попросить код на телефон.
+async fn login_request(shared: &Arc<Shared>, phone: String) {
+    let phone = phone.trim().to_string();
+    if phone.is_empty() || phone == "+" {
+        shared.set_login(LoginStage::Failed(
+            "Укажи телефон в формате +79991234567".into(),
+        ));
+        return;
+    }
+    // Прошлое соединение входа больше не нужно: `phone_code_hash` устарел.
+    login_abort(shared, "").await;
+
+    let cfg = shared.cfg();
+    shared.log(format!("[вход] отправляю код на {phone}"));
+    let conn = match crate::connect(&cfg, true).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            shared.log(format!("[вход] не удалось подключиться: {e}"));
+            shared.set_login(LoginStage::Failed(format!("{e}")));
+            return;
+        }
+    };
+
+    let client = conn.0.clone();
+    match client.request_login_code(&phone, &cfg.api_hash).await {
+        Ok(token) => {
+            *shared.login_conn.lock().await = Some(LoginConn {
+                client,
+                conn,
+                token: Some(token),
+                password: None,
+            });
+            shared.set_login(LoginStage::AwaitingCode);
+        }
+        Err(e) => {
+            conn.2.quit();
+            let text = format!("не удалось отправить код на {phone}: {e}");
+            shared.log(format!("[вход] {text}"));
+            shared.set_login(LoginStage::Failed(text));
+        }
+    }
+}
+
+/// Шаг 2: проверить код из Telegram (или перейти к паролю 2FA).
+async fn login_code(shared: &Arc<Shared>, code: String) {
+    let code = code.trim().to_string();
+    let mut guard = shared.login_conn.lock().await;
+    let Some(entry) = guard.as_mut() else {
+        drop(guard);
+        shared.set_login(LoginStage::Failed(
+            "Соединение входа закрыто — отправь код заново".into(),
+        ));
+        return;
+    };
+    let Some(token) = entry.token.take() else {
+        drop(guard);
+        shared.set_login(LoginStage::Failed("Отправь код заново".into()));
+        return;
+    };
+
+    match entry.client.sign_in(&token, &code).await {
+        Ok(_) => {
+            let entry = guard.take().expect("соединение входа на месте");
+            drop(guard);
+            login_success(shared, entry).await;
+        }
+        Err(SignInError::PasswordRequired(password)) => {
+            entry.password = Some(password);
+            drop(guard);
+            shared.log("[вход] Telegram просит пароль 2FA");
+            shared.set_login(LoginStage::AwaitingPassword(String::new()));
+        }
+        Err(e) => {
+            entry.token = Some(token);
+            drop(guard);
+            shared.log(format!("[вход] код не принят: {e}"));
+            shared.set_login(LoginStage::Failed(format!("Код не принят: {e}")));
+        }
+    }
+}
+
+/// Шаг 3: пароль двухфакторной авторизации.
+async fn login_password(shared: &Arc<Shared>, password: String) {
+    let mut guard = shared.login_conn.lock().await;
+    let Some(entry) = guard.as_mut() else {
+        drop(guard);
+        shared.set_login(LoginStage::Failed(
+            "Соединение входа закрыто — начни заново".into(),
+        ));
+        return;
+    };
+    let Some(token) = entry.password.take() else {
+        drop(guard);
+        shared.set_login(LoginStage::Failed("Пароль уже проверялся".into()));
+        return;
+    };
+
+    match entry.client.check_password(token, password.trim()).await {
+        Ok(_) => {
+            let entry = guard.take().expect("соединение входа на месте");
+            drop(guard);
+            login_success(shared, entry).await;
+        }
+        Err(e) => {
+            drop(guard);
+            shared.log(format!("[вход] пароль не принят: {e}"));
+            shared.set_login(LoginStage::Failed(format!("Пароль не принят: {e}")));
+        }
+    }
+}
+
+/// Вход завершён: узнать имя, закрыть временное соединение, отметить сессию.
+async fn login_success(shared: &Arc<Shared>, entry: LoginConn) {
+    let name = match entry.client.get_me().await {
+        Ok(me) => me.first_name().unwrap_or("аккаунт").to_string(),
+        Err(_) => "аккаунт".to_string(),
+    };
+    entry.conn.2.quit();
+    let _ = entry.conn.3.await;
+    shared.set_status(|s| {
+        s.authorized = true;
+        s.connected = false;
+        s.message = "вход выполнен".into();
+    });
+    shared.set_login(LoginStage::Done(format!("Вошли как {name}")));
+    shared.log(format!("[вход] готово, {name} — сессия сохранена"));
+}
+
+/// Закрыть соединение входа. С непустой причиной — ещё и сбросить этап.
+async fn login_abort(shared: &Arc<Shared>, reason: &str) {
+    let entry = shared.login_conn.lock().await.take();
+    if let Some(entry) = entry {
+        entry.conn.2.quit();
+    }
+    if !reason.is_empty() {
+        shared.log(format!("[вход] {reason}"));
+        shared.set_login(LoginStage::Idle);
+    }
+}
+
 /// Запуск движка в отдельном потоке со своим tokio-рантаймом.
 pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     std::thread::spawn(move || {
@@ -443,8 +923,11 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
             .expect("не удалось создать tokio runtime для движка");
         rt.block_on(async move {
             spawn_pet(shared.clone());
+            spawn_printer(shared.clone());
             spawn_bonus(shared.clone(), BonusKind::Channel);
             spawn_bonus(shared.clone(), BonusKind::Dm);
+            spawn_race(shared.clone());
+            spawn_business(shared.clone());
 
             while let Some(cmd) = rx.recv().await {
                 match cmd {
@@ -467,8 +950,61 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                         shared.pet_forced.store(true, Ordering::SeqCst);
                         shared.pet_wake.notify_waiters();
                     }
+                    Command::PrinterNow => {
+                        shared.printer_forced.store(true, Ordering::SeqCst);
+                        shared.printer_wake.notify_waiters();
+                    }
+                    Command::PrinterRefillNow => {
+                        shared.printer_refill_forced.store(true, Ordering::SeqCst);
+                        shared.printer_wake.notify_waiters();
+                    }
+                    Command::PrinterWithdrawNow => {
+                        shared.printer_withdraw_forced.store(true, Ordering::SeqCst);
+                        shared.printer_wake.notify_waiters();
+                    }
                     Command::BonusNow => shared.trigger_bonus(BonusKind::Channel),
                     Command::BonusDmNow => shared.trigger_bonus(BonusKind::Dm),
+                    Command::RaceNow => {
+                        shared.race_forced.store(true, Ordering::SeqCst);
+                        shared.race_wake.notify_waiters();
+                    }
+                    Command::BusinessNow => {
+                        shared.business_forced.store(true, Ordering::SeqCst);
+                        shared.business_wake.notify_waiters();
+                    }
+                    Command::ProfileNow => {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            let cfg = shared.cfg();
+                            if let Err(e) = profile_once(&shared, &cfg).await {
+                                shared.log(format!("[профиль] ошибка: {e}"));
+                            }
+                        });
+                    }
+                    Command::LoginRequest { phone } => {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            login_request(&shared, phone).await;
+                        });
+                    }
+                    Command::LoginCode { code } => {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            login_code(&shared, code).await;
+                        });
+                    }
+                    Command::LoginPassword { password } => {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            login_password(&shared, password).await;
+                        });
+                    }
+                    Command::LoginCancel => {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            login_abort(&shared, "вход отменён").await;
+                        });
+                    }
                     Command::SetConfig(cfg) => {
                         let pet_changed = {
                             let old = shared.cfg.lock().unwrap();
@@ -476,15 +1012,46 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                                 || old.pet.interval_secs != cfg.pet.interval_secs
                                 || old.pet.interval_jitter_secs != cfg.pet.interval_jitter_secs
                         };
+                        let printer_changed = {
+                            let old = shared.cfg.lock().unwrap();
+                            old.printer.enabled != cfg.printer.enabled
+                                || old.printer.interval_secs != cfg.printer.interval_secs
+                                || old.printer.interval_jitter_secs != cfg.printer.interval_jitter_secs
+                        };
                         let bonus_changed = {
                             let old = shared.cfg.lock().unwrap();
                             bonus_differs(&old.bonus, &cfg.bonus)
                                 || bonus_differs(&old.bonus_dm, &cfg.bonus_dm)
                         };
+                        let race_changed = {
+                            let old = shared.cfg.lock().unwrap();
+                            old.race.enabled != cfg.race.enabled
+                                || old.race.interval_secs != cfg.race.interval_secs
+                                || old.race.interval_jitter_secs != cfg.race.interval_jitter_secs
+                        };
+                        let business_changed = {
+                            let old = shared.cfg.lock().unwrap();
+                            old.business.enabled != cfg.business.enabled
+                                || old.business.interval_secs != cfg.business.interval_secs
+                                || old.business.interval_jitter_secs
+                                    != cfg.business.interval_jitter_secs
+                        };
                         shared.set_cfg(cfg);
+                        if business_changed {
+                            shared.reschedule_business();
+                            shared.business_wake.notify_waiters();
+                        }
+                        if race_changed {
+                            shared.reschedule_race();
+                            shared.race_wake.notify_waiters();
+                        }
                         if pet_changed {
                             shared.reschedule_pet();
                             shared.pet_wake.notify_waiters();
+                        }
+                        if printer_changed {
+                            shared.reschedule_printer();
+                            shared.printer_wake.notify_waiters();
                         }
                         if bonus_changed {
                             // Срок берётся из ответа бота; пересчитываем только
@@ -686,7 +1253,6 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
                     }
                 }
                 Ok(Wait::Timeout) => {
-                    pending = None;
                     stop_casino(&shared, "бот не ответил на ставку");
                     break 'outer;
                 }
@@ -983,12 +1549,14 @@ const BONUS_RETRY_SOON: u64 = 5 * 60;
 /// текст другой. Поэтому парсер не цепляется за конкретные слова и статус, а
 /// просто собирает все пары «число + единица времени». Суммы денег, GB, стрики
 /// и множители отбрасываются: у них нет единиц времени.
+
+
 pub(crate) fn parse_bonus_delay(text: &str) -> Option<u64> {
     // Слишком маленькие значения — это не срок, а мусор вроде «1 раз».
     parse_duration(&text.to_lowercase()).filter(|secs| *secs >= 5)
 }
 
-fn parse_duration(text: &str) -> Option<u64> {
+pub(crate) fn parse_duration(text: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut found = 0u32;
     let mut num = String::new();
@@ -1115,14 +1683,15 @@ async fn bonus_once(shared: &Shared, cfg: &Config, kind: BonusKind) -> Result<()
             shared.log(format!("{tag} отправлено (id {})", sent.id()));
 
             // Ответ на любую из попыток считаем ответом на команду.
-            let after = *after_id.get_or_insert(sent.id());
+            // Ignore already-consumed replies on later retry attempts.
+            let after = after_id.unwrap_or(sent.id());
             let deadline =
                 tokio::time::Instant::now() + Duration::from_secs(BONUS_REPLY_TIMEOUT);
             wait_reply(
                 &chat.client,
                 &mut none,
                 peer,
-                peer.id,
+                chat.bot_id,
                 after,
                 deadline,
                 &cancel,
@@ -1134,21 +1703,34 @@ async fn bonus_once(shared: &Shared, cfg: &Config, kind: BonusKind) -> Result<()
         // Интервал берём из ответа бота («⏳ Следующий бонус через 12ч»),
         // а из настроек — только разброс и запасное значение.
         let base = match waited {
-            Ok(Wait::Reply(_, text)) => {
+            Ok(Wait::Reply(reply_id, text)) => {
+                after_id = Some(reply_id);
                 let line = one_line(&text);
                 shared.set_status(|s| s.last_bot_reply = line.clone());
                 shared.log(format!("{tag} бот: {line}"));
-                match parse_bonus_delay(&text) {
-                    Some(secs) => {
-                        shared.log(format!("{tag} бот назвал срок: {}", fmt_secs(secs as i64)));
+                match classify_bonus_reply(&text) {
+                    BonusReply::Claimed(Some(secs)) => {
+                        shared.log(format!("{tag} награда подтверждена, бот назвал срок: {}", fmt_secs(secs as i64)));
                         secs as i64
                     }
-                    None => {
-                        shared.log(format!(
-                            "{tag} в ответе нет срока — беру запасные {}",
-                            fmt_secs(bonus.interval_secs as i64)
-                        ));
+                    BonusReply::Claimed(None) => {
+                        shared.log(format!("{tag} награда подтверждена, беру интервал {}", fmt_secs(bonus.interval_secs as i64)));
                         bonus.interval_secs as i64
+                    }
+                    BonusReply::Cooldown(secs) => {
+                        shared.log(format!("{tag} награда не выдана — повтор после кулдауна {}", fmt_secs(secs as i64)));
+                        shared.set_next_bonus(kind, now_unix() + secs.max(60) as i64);
+                        return Ok(());
+                    }
+                    BonusReply::Unconfirmed => {
+                        if attempt < BONUS_ATTEMPTS {
+                            shared.log(format!("{tag} ответ не подтверждает выдачу бонуса — повтор {attempt}/{BONUS_ATTEMPTS}"));
+                            tokio::time::sleep(Duration::from_secs(BONUS_RETRY_GAP)).await;
+                            continue;
+                        }
+                        shared.log(format!("{tag} выдача бонуса не подтверждена после {BONUS_ATTEMPTS} попыток — повторю через {}", fmt_secs(BONUS_RETRY_SOON as i64)));
+                        shared.set_next_bonus(kind, now_unix() + BONUS_RETRY_SOON as i64);
+                        return Ok(());
                     }
                 }
             }
@@ -1304,24 +1886,314 @@ async fn pet_send_confirmed(
     Ok(None)
 }
 
+/// Разбор статуса принтера из ответа бота:
+/// * `cartridge_pct` — процент оставшегося картриджа («🎨 Осталось картриджа: 63%»);
+/// * `can_withdraw` — сумма «🏧 Можно снять: 166.273.388.889$» (в долларах).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PrinterInfo {
+    pub cartridge_pct: Option<u8>,
+    pub can_withdraw: Option<u64>,
+}
+
+pub(crate) fn parse_printer_info(reply: &str) -> PrinterInfo {
+    let mut info = PrinterInfo::default();
+    for line in reply.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("картридж") {
+            if let Some(pct) = parse_percent_in_line(&lower) {
+                info.cartridge_pct = Some(pct);
+            }
+        }
+        if lower.contains("можно снять") {
+            if let Some(amount) = parse_money_after_colon(&lower) {
+                info.can_withdraw = Some(amount);
+            }
+        }
+    }
+    info
+}
+
+fn parse_percent_in_line(line: &str) -> Option<u8> {
+    let pct_pos = line.find('%')?;
+    let before = &line[..pct_pos];
+    let digits: String = before
+        .chars()
+        .rev()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse::<u8>().ok().map(|v| v.min(100))
+}
+
+fn parse_money_after_colon(line: &str) -> Option<u64> {
+    let tail = match line.find(':') {
+        Some(pos) => &line[pos + 1..],
+        None => line,
+    };
+    let digits: String = tail.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// Таймер принтера: спит до ближайшего срока и обслуживает принтер.
+fn spawn_printer(shared: Arc<Shared>) {
+    tokio::spawn(async move {
+        loop {
+            let forced_any = shared.printer_forced.load(Ordering::SeqCst)
+                || shared.printer_refill_forced.load(Ordering::SeqCst)
+                || shared.printer_withdraw_forced.load(Ordering::SeqCst);
+
+            if !forced_any {
+                let Some(wait) = shared.next_printer_in() else {
+                    shared.printer_wake.notified().await;
+                    continue;
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = shared.printer_wake.notified() => {}
+                }
+            }
+
+            let forced = shared.printer_forced.swap(false, Ordering::SeqCst);
+            let refill_only = shared.printer_refill_forced.swap(false, Ordering::SeqCst);
+            let withdraw_only = shared.printer_withdraw_forced.swap(false, Ordering::SeqCst);
+
+            let cfg = shared.cfg();
+            if refill_only || withdraw_only {
+                if let Err(e) = printer_direct_actions(&shared, &cfg, refill_only, withdraw_only).await {
+                    shared.log(format!("[принтер] ошибка: {e}"));
+                    shared.reset_chat().await;
+                }
+                if !forced {
+                    continue;
+                }
+            }
+
+            if !cfg.printer.enabled && !forced {
+                continue;
+            }
+            if !forced {
+                match shared.next_printer_in() {
+                    Some(left) if left > Duration::from_millis(0) => continue,
+                    _ => {}
+                }
+            }
+
+            if let Err(e) = printer_once(&shared, &cfg).await {
+                shared.log(format!("[принтер] ошибка: {e}"));
+                shared.reset_chat().await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    });
+}
+
+async fn printer_direct_actions(
+    shared: &Shared,
+    cfg: &Config,
+    do_refill: bool,
+    do_withdraw: bool,
+) -> Result<(), BoxError> {
+    let chat = shared.chat().await?;
+    if do_refill && !cfg.printer.refill_command.trim().is_empty() {
+        printer_send_confirmed(
+            shared,
+            &chat,
+            cfg.printer.refill_command.trim(),
+            cfg.printer.reply_timeout_secs,
+        )
+        .await?;
+    }
+    if do_withdraw && !cfg.printer.withdraw_command.trim().is_empty() {
+        if do_refill {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        printer_send_confirmed(
+            shared,
+            &chat,
+            cfg.printer.withdraw_command.trim(),
+            cfg.printer.reply_timeout_secs,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn printer_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
+    let chat = shared.chat().await?;
+    let reply = printer_send_confirmed(
+        shared,
+        &chat,
+        cfg.printer.command.trim(),
+        cfg.printer.reply_timeout_secs,
+    )
+    .await?;
+
+    let Some(text) = reply else {
+        shared.log(format!(
+            "[принтер] бот молчит после {PET_ATTEMPTS} попыток — повторю через {}",
+            fmt_secs(PET_RETRY_SOON as i64)
+        ));
+        shared.set_next_printer(now_unix() + PET_RETRY_SOON as i64);
+        return Ok(());
+    };
+
+    let info = parse_printer_info(&text);
+    let lower = text.to_lowercase();
+    let broken_or_jammed = lower.contains("слом") || lower.contains("заклин");
+
+    let need_refill = cfg.printer.auto_refill
+        && !cfg.printer.refill_command.trim().is_empty()
+        && match info.cartridge_pct {
+            Some(pct) => pct <= cfg.printer.refill_below_percent.min(100) && pct < 100,
+            None => broken_or_jammed,
+        };
+
+    if need_refill {
+        if let Some(pct) = info.cartridge_pct {
+            shared.log(format!(
+                "[принтер] картридж {pct}% (порог {}%) → {}",
+                cfg.printer.refill_below_percent, cfg.printer.refill_command
+            ));
+        } else {
+            shared.log(format!("[принтер] заправка → {}", cfg.printer.refill_command));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        printer_send_confirmed(
+            shared,
+            &chat,
+            cfg.printer.refill_command.trim(),
+            cfg.printer.reply_timeout_secs,
+        )
+        .await?;
+    }
+
+    let need_withdraw = cfg.printer.auto_withdraw
+        && !cfg.printer.withdraw_command.trim().is_empty()
+        && info.can_withdraw.map_or(false, |amt| amt > 0);
+
+    if need_withdraw {
+        if let Some(amt) = info.can_withdraw {
+            shared.log(format!(
+                "[принтер] можно снять {amt}$ → {}",
+                cfg.printer.withdraw_command
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        printer_send_confirmed(
+            shared,
+            &chat,
+            cfg.printer.withdraw_command.trim(),
+            cfg.printer.reply_timeout_secs,
+        )
+        .await?;
+    }
+
+    shared.set_last_printer(now_unix());
+    Ok(())
+}
+
+async fn printer_send(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<String>, BoxError> {
+    let _guard = chat.peer_lock.lock().await;
+    shared.log(format!("[принтер] → {cmd}"));
+    let sent = chat.client.send_message(chat.bot_ref, cmd).await?;
+
+    let mut none: Option<UpdateStream> = None;
+    let cancel = AtomicBool::new(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let waited = wait_reply(
+        &chat.client,
+        &mut none,
+        chat.bot_ref,
+        chat.bot_id,
+        sent.id(),
+        deadline,
+        &cancel,
+        false,
+    )
+    .await;
+
+    match waited {
+        Ok(Wait::Reply(_, text)) => {
+            shared.set_status(|s| s.last_bot_reply = one_line(&text));
+            shared.log(format!("[принтер] {}", one_line(&text)));
+            Ok(Some(text))
+        }
+        Ok(Wait::Timeout) => {
+            shared.log("[принтер] ответ не пришёл за отведённое время");
+            Ok(None)
+        }
+        Ok(Wait::Cancelled) => Ok(None),
+        Err(e) => {
+            shared.log(format!("[принтер] {e}"));
+            shared.reset_chat().await;
+            Err(e)
+        }
+    }
+}
+
+async fn printer_send_confirmed(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<String>, BoxError> {
+    for attempt in 1..=PET_ATTEMPTS {
+        if let Some(text) = printer_send(shared, chat, cmd, timeout_secs).await? {
+            return Ok(Some(text));
+        }
+        if attempt < PET_ATTEMPTS {
+            shared.log(format!(
+                "[принтер] бот не ответил на «{cmd}» — повтор {attempt}/{PET_ATTEMPTS}"
+            ));
+            tokio::time::sleep(Duration::from_secs(PET_RETRY_GAP)).await;
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_bonus_delay, pet_prep_command};
+    use super::{classify_bonus_reply, parse_bonus_delay, parse_printer_info, pet_prep_command, BonusReply, PrinterInfo};
 
     #[test]
-    fn parses_any_bot_variant() {
-        // VIP-ответ с готовым бонусом.
+    fn classifies_bonus_replies() {
+        assert_eq!(
+            classify_bonus_reply("Nekiplay, бонус 26.000.000$ и 400 GB 🙂"),
+            BonusReply::Claimed(None)
+        );
+        assert_eq!(
+            classify_bonus_reply("Роман, до получения бонуса 6 мин. 29 сек. ⏳"),
+            BonusReply::Cooldown(389)
+        );
+        assert_eq!(
+            classify_bonus_reply("Бонус временно недоступен"),
+            BonusReply::Unconfirmed
+        );
+        assert_eq!(
+            classify_bonus_reply("Роман (https://t.me/nekiplay), VIP бонус +200 GB 💵"),
+            BonusReply::Claimed(None)
+        );
+    }
+
+    #[test]
+    fn parses_bonus_delay() {
         assert_eq!(parse_bonus_delay("Nekiplay, бонус 26.000.000$ и 400 GB 🙂\n🔥 Стрик: 1/7\n⏳ Следующий бонус через 12ч."), Some(12 * 3600));
-        // Кулдаун в канале.
         assert_eq!(parse_bonus_delay("Роман, до получения бонуса 6 мин. 29 сек. ⏳"), Some(389));
         assert_eq!(parse_bonus_delay("Роман, до получения бонуса 10 мин. 9 сек. ⏳"), Some(609));
-        // Без слова «бонус» рядом.
         assert_eq!(parse_bonus_delay("Попробуйте через 3 часа 😉"), Some(3 * 3600));
         assert_eq!(parse_bonus_delay("Приходите через 2 дня"), Some(2 * 86_400));
-        // Уже получен, без срока — таймер возьмёт запасной интервал.
         assert_eq!(parse_bonus_delay("Роман, VIP бонус +200 GB 💵"), None);
-        assert_eq!(parse_bonus_delay("Nekiplay, бонус 26.000.000$ и 400 GB 🙂"), None);
-        // Баланс и ставки не должны превращаться в срок.
         assert_eq!(parse_bonus_delay("Баланс: 2.046.868.646.673$"), None);
     }
 
@@ -1336,4 +2208,476 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn parses_printer_reply() {
+        let sample = "Nekiplay (http://t.me/nekiplay), информация «HP Color LaserJet»:\n\
+                      💸 Печатает 2.300.000.000$/час\n\
+                      💰 Напечатал: 166.273.388.889$\n\
+                      🏧 Можно снять: 166.273.388.889$\n\
+                      🎨 Осталось картриджа: 63%\n\n\
+                      ✨ Не забывайте перезаправлять принтер краской иначе его заклинит и он сломается! Команда: «принтер заправить»\n\
+                      🏧 Снять деньги с принтера, команда: «принтер снять»";
+        assert_eq!(
+            parse_printer_info(sample),
+            PrinterInfo {
+                cartridge_pct: Some(63),
+                can_withdraw: Some(166_273_388_889),
+            }
+        );
+
+        let empty = "Nekiplay, информация «HP Color LaserJet»:\n\
+                     💸 Печатает 2.300.000.000$/час\n\
+                     💰 Напечатал: 0$\n\
+                     🏧 Можно снять: 0$\n\
+                     🎨 Осталось картриджа: 100%";
+        assert_eq!(
+            parse_printer_info(empty),
+            PrinterInfo {
+                cartridge_pct: Some(100),
+                can_withdraw: Some(0),
+            }
+        );
+    }
+}
+
+// --- Гонка (заезд) -------------------------------------------------------
+
+/// Сколько раз пробуем отправить команду, если бот молчит.
+const RACE_ATTEMPTS: u32 = 3;
+/// Пауза между попытками отправки.
+const RACE_RETRY_GAP: u64 = 25;
+/// Пауза перед повтором, если ответ не распознан или результата нет.
+const RACE_RETRY_SOON: i64 = race::RETRY_SOON_SECS;
+
+/// Цикл авто-гонки: едет по расписанию, пережидает техосмотр и ждёт результат.
+fn spawn_race(shared: Arc<Shared>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(wait) = shared.next_race_in() else {
+                shared.race_wake.notified().await;
+                continue;
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = shared.race_wake.notified() => {}
+            }
+
+            let forced = shared.race_forced.swap(false, Ordering::SeqCst);
+            let cfg = shared.cfg();
+            if !cfg.race.enabled && !forced {
+                continue;
+            }
+            if !forced {
+                match shared.next_race_in() {
+                    Some(left) if left > Duration::from_millis(0) => continue,
+                    _ => {}
+                }
+            }
+
+            if let Err(e) = race_once(&shared, &cfg).await {
+                shared.log(format!("[гонка] ошибка: {e}"));
+                shared.reset_chat().await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    });
+}
+
+fn race_result_line(win: bool, delta: Option<i64>) -> String {
+    let mut line = if win {
+        "[гонка] победа".to_string()
+    } else {
+        "[гонка] проигрыш".to_string()
+    };
+    if let Some(rating) = delta {
+        line.push_str(&format!(", рейтинг {rating:+}"));
+    }
+    line
+}
+
+/// Один заезд: команда → техосмотр → ожидание финиша.
+async fn race_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
+    let chat = shared.chat().await?;
+    let Some((start_id, reply)) = race_send_confirmed(
+        shared,
+        &chat,
+        &cfg.race.command,
+        cfg.race.reply_timeout_secs,
+    )
+    .await?
+    else {
+        shared.log("[гонка] бот молчит после нескольких попыток — повторю позже");
+        shared.set_next_race(now_unix() + RACE_RETRY_SOON);
+        return Ok(());
+    };
+
+    match race::parse_reply(&reply) {
+        RaceReply::Inspection(secs) => {
+            // Ждём окончания техосмотра и отправляем команду заново.
+            let due = now_unix() + secs as i64 + cfg.race.cooldown_margin_secs as i64;
+            shared.log(format!("[гонка] техосмотр: {}", fmt_secs(secs as i64)));
+            shared.set_next_race(due);
+            Ok(())
+        }
+        RaceReply::Started => {
+            shared.log("[гонка] заезд начался, жду результат");
+            let mut after_id = start_id;
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(cfg.race.result_timeout_secs);
+            loop {
+                let mut none: Option<UpdateStream> = None;
+                let cancel = AtomicBool::new(false);
+                let waited = wait_reply(
+                    &chat.client,
+                    &mut none,
+                    chat.bot_ref,
+                    chat.bot_id,
+                    after_id,
+                    deadline,
+                    &cancel,
+                    false,
+                )
+                .await?;
+                match waited {
+                    Wait::Reply(id, text) => {
+                        after_id = id;
+                        shared.set_status(|s| s.last_bot_reply = one_line(&text));
+                        shared.log(format!("[гонка] {}", one_line(&text)));
+                        match race::parse_reply(&text) {
+                            RaceReply::Finish { win, delta } => {
+                                shared.log(race_result_line(win, delta));
+                                shared.set_last_race(now_unix());
+                                return Ok(());
+                            }
+                            RaceReply::Inspection(secs) => {
+                                let due = now_unix()
+                                    + secs as i64
+                                    + cfg.race.cooldown_margin_secs as i64;
+                                shared.set_next_race(due);
+                                return Ok(());
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Wait::Timeout => {
+                        shared.log("[гонка] результат не пришёл — повторю позже");
+                        shared.set_next_race(now_unix() + RACE_RETRY_SOON);
+                        return Ok(());
+                    }
+                    Wait::Cancelled => return Ok(()),
+                }
+            }
+        }
+        RaceReply::Finish { win, delta } => {
+            shared.log(race_result_line(win, delta));
+            shared.set_last_race(now_unix());
+            Ok(())
+        }
+        RaceReply::Unknown => {
+            shared.log(format!("[гонка] ответ не распознан: {}", one_line(&reply)));
+            shared.set_next_race(now_unix() + RACE_RETRY_SOON);
+            Ok(())
+        }
+    }
+}
+
+/// Отправка команды гонки. Возвращает id сообщения и ответ бота.
+async fn race_send(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<(i32, String)>, BoxError> {
+    let _guard = chat.peer_lock.lock().await;
+    shared.log(format!("[гонка] → {cmd}"));
+    let sent = chat.client.send_message(chat.bot_ref, cmd).await?;
+
+    let mut none: Option<UpdateStream> = None;
+    let cancel = AtomicBool::new(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let waited = wait_reply(
+        &chat.client,
+        &mut none,
+        chat.bot_ref,
+        chat.bot_id,
+        sent.id(),
+        deadline,
+        &cancel,
+        false,
+    )
+    .await;
+
+    match waited {
+        Ok(Wait::Reply(id, text)) => Ok(Some((id, text))),
+        Ok(Wait::Timeout) => Ok(None),
+        Ok(Wait::Cancelled) => Ok(None),
+        Err(e) => {
+            shared.log(format!("[гонка] {e}"));
+            shared.reset_chat().await;
+            Err(e)
+        }
+    }
+}
+
+/// Отправка с повторами: бот иногда не отвечает с первого раза.
+async fn race_send_confirmed(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<(i32, String)>, BoxError> {
+    for attempt in 1..=RACE_ATTEMPTS {
+        if let Some(reply) = race_send(shared, chat, cmd, timeout_secs).await? {
+            return Ok(Some(reply));
+        }
+        if attempt < RACE_ATTEMPTS {
+            shared.log(format!(
+                "[гонка] бот не ответил на «{cmd}» — повтор {attempt}/{RACE_ATTEMPTS}"
+            ));
+            tokio::time::sleep(Duration::from_secs(RACE_RETRY_GAP)).await;
+        }
+    }
+    Ok(None)
+}
+
+const PROFILE_ATTEMPTS: u32 = 2;
+const PROFILE_RETRY_GAP: u64 = 25;
+
+/// Запрос профиля игрока: «Профиль» → разбор ответа бота.
+async fn profile_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
+    let chat = shared.chat().await?;
+    let mut reply = None;
+    for attempt in 1..=PROFILE_ATTEMPTS {
+        if let Some(text) =
+            profile_send(shared, &chat, "Профиль", cfg.casino.reply_timeout_secs).await?
+        {
+            reply = Some(text);
+            break;
+        }
+        if attempt < PROFILE_ATTEMPTS {
+            shared.log("[профиль] бот не ответил — повторяю");
+            tokio::time::sleep(Duration::from_secs(PROFILE_RETRY_GAP)).await;
+        }
+    }
+
+    let Some(text) = reply else {
+        shared.log("[профиль] бот не ответил, профиль не обновлён");
+        return Ok(());
+    };
+
+    match profile::parse(&text) {
+        Some(profile) => {
+            shared.log(format!(
+                "[профиль] обновлён: уровень {}, наличные {}",
+                profile.level.as_deref().unwrap_or("—"),
+                profile.cash.as_deref().unwrap_or("—")
+            ));
+            shared.set_profile(profile);
+        }
+        None => shared.log(format!(
+            "[профиль] ответ не распознан: {}",
+            crate::one_line(&text)
+        )),
+    }
+    Ok(())
+}
+
+/// Отправка «Профиль» с ожиданием ответа бота.
+async fn profile_send(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<String>, BoxError> {
+    let _guard = chat.peer_lock.lock().await;
+    shared.log(format!("[профиль] → {cmd}"));
+    let sent = match chat.client.send_message(chat.bot_ref, cmd).await {
+        Ok(sent) => sent,
+        Err(e) => {
+            shared.reset_chat().await;
+            return Err(e.into());
+        }
+    };
+
+    let mut none: Option<UpdateStream> = None;
+    let cancel = AtomicBool::new(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let waited = wait_reply(
+        &chat.client,
+        &mut none,
+        chat.bot_ref,
+        chat.bot_id,
+        sent.id(),
+        deadline,
+        &cancel,
+        false,
+    )
+    .await;
+
+    match waited {
+        Ok(Wait::Reply(_, text)) => Ok(Some(text)),
+        Ok(_) => Ok(None),
+        Err(e) => {
+            shared.log(format!("[профиль] {e}"));
+            shared.reset_chat().await;
+            Err(e)
+        }
+    }
+}
+
+// ── Бизнес: снятие дохода ──────────────────────────────────────────────────
+
+const BUSINESS_ATTEMPTS: u32 = 3;
+const BUSINESS_RETRY_GAP: u64 = 25;
+const BUSINESS_RETRY_SOON: i64 = 5 * 60;
+
+/// Проверяем, что сообщение бота адресовано нашему игроку.
+fn reply_for_player(shared: &Shared, text: &str) -> bool {
+    let cfg = shared.cfg();
+    let name = cfg.player_name.trim();
+    if name.is_empty() {
+        return true;
+    }
+    text.to_lowercase().contains(&name.to_lowercase())
+}
+
+/// Достаём сумму из «вы сняли с бизнеса 82.936.250.000$».
+fn business_amount(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| l.contains("сняли с бизнеса"))?;
+    let digits: String = line
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ' ')
+        .filter(|c| *c != ' ')
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+/// Цикл автоснятия бизнеса: раз в час (по умолчанию 1 ч 4 мин).
+fn spawn_business(shared: Arc<Shared>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(wait) = shared.next_business_in() else {
+                shared.business_wake.notified().await;
+                continue;
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = shared.business_wake.notified() => {}
+            }
+
+            let forced = shared.business_forced.swap(false, Ordering::SeqCst);
+            let cfg = shared.cfg();
+            if !cfg.business.enabled && !forced {
+                continue;
+            }
+            if !forced {
+                match shared.next_business_in() {
+                    Some(left) if left > Duration::from_millis(0) => continue,
+                    _ => {}
+                }
+            }
+
+            if let Err(e) = business_once(&shared, &cfg).await {
+                shared.log(format!("[бизнес] ошибка: {e}"));
+                shared.reset_chat().await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    });
+}
+
+async fn business_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
+    let chat = shared.chat().await?;
+    let Some(reply) = business_send_confirmed(
+        shared,
+        &chat,
+        &cfg.business.command,
+        cfg.business.reply_timeout_secs,
+    )
+    .await?
+    else {
+        shared.log("[бизнес] бот молчит после нескольких попыток — повторю позже");
+        shared.set_next_business(now_unix() + BUSINESS_RETRY_SOON);
+        return Ok(());
+    };
+
+    if !reply_for_player(shared, &reply) {
+        shared.log(format!(
+            "[бизнес] ответ не для игрока «{}», пропускаю: {}",
+            cfg.player_name,
+            one_line(&reply)
+        ));
+        shared.set_next_business(now_unix() + BUSINESS_RETRY_SOON);
+        return Ok(());
+    }
+
+    match business_amount(&reply) {
+        Some(sum) => shared.log(format!("[бизнес] снято {sum}$")),
+        None => shared.log(format!("[бизнес] ответ: {}", one_line(&reply))),
+    }
+    shared.set_last_business(now_unix());
+    Ok(())
+}
+
+async fn business_send(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<String>, BoxError> {
+    let _guard = chat.peer_lock.lock().await;
+    shared.log(format!("[бизнес] → {cmd}"));
+    let sent = chat.client.send_message(chat.bot_ref, cmd).await?;
+
+    let mut none: Option<UpdateStream> = None;
+    let cancel = AtomicBool::new(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let waited = wait_reply(
+        &chat.client,
+        &mut none,
+        chat.bot_ref,
+        chat.bot_id,
+        sent.id(),
+        deadline,
+        &cancel,
+        false,
+    )
+    .await;
+
+    match waited {
+        Ok(Wait::Reply(_id, text)) => Ok(Some(text)),
+        Ok(Wait::Timeout) => Ok(None),
+        Ok(Wait::Cancelled) => Ok(None),
+        Err(e) => {
+            shared.log(format!("[бизнес] {e}"));
+            shared.reset_chat().await;
+            Err(e)
+        }
+    }
+}
+
+async fn business_send_confirmed(
+    shared: &Shared,
+    chat: &Chat,
+    cmd: &str,
+    timeout_secs: u64,
+) -> Result<Option<String>, BoxError> {
+    for attempt in 1..=BUSINESS_ATTEMPTS {
+        if let Some(reply) = business_send(shared, chat, cmd, timeout_secs).await? {
+            return Ok(Some(reply));
+        }
+        if attempt < BUSINESS_ATTEMPTS {
+            shared.log(format!(
+                "[бизнес] бот не ответил на «{cmd}» — повтор {attempt}/{BUSINESS_ATTEMPTS}"
+            ));
+            tokio::time::sleep(Duration::from_secs(BUSINESS_RETRY_GAP)).await;
+        }
+    }
+    Ok(None)
 }

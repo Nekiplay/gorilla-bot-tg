@@ -34,6 +34,18 @@
     "feed_command": "Питомец покормить",
     "feed_when_hungry": true
   },
+  "printer": {
+    "enabled": true,
+    "command": "Принтер",
+    "refill_command": "Принтер заправить",
+    "withdraw_command": "Принтер снять",
+    "auto_refill": true,
+    "refill_below_percent": 95,
+    "auto_withdraw": true,
+    "interval_secs": 3600,
+    "interval_jitter_secs": 300,
+    "reply_timeout_secs": 30
+  },
   "bonus": {
     "enabled": true,
     "target": "gorillabot_double",
@@ -47,5 +59,22 @@
     "command": "Бонус",
     "interval_secs": 43200,
     "jitter_secs": 300
+  },
+  "race": {
+    "enabled": true,
+    "command": "Гонка",
+    "interval_secs": 1800,
+    "interval_jitter_secs": 300,
+    "reply_timeout_secs": 45,
+    "cooldown_margin_secs": 10,
+    "result_timeout_secs": 240
+  },
+  "player_name": "",
+  "business": {
+    "enabled": true,
+    "command": "Бизнес снять",
+    "interval_secs": 3840,
+    "interval_jitter_secs": 0,
+    "reply_timeout_secs": 45
   }
 }
