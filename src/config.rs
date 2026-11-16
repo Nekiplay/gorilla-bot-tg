@@ -49,6 +49,9 @@ pub struct Config {
     /// Автоснятие денег с бизнеса («Бизнес снять»).
     #[serde(default)]
     pub business: BusinessConfig,
+    /// Автоподбор кода «Сейф» (две цифры, попытки не ограничены).
+    #[serde(default)]
+    pub safe: SafeConfig,
     /// Ник игрока в боте: по нему проверяем, что ответ адресован нам.
     #[serde(default)]
     pub player_name: String,
@@ -503,6 +506,35 @@ impl Default for RaceConfig {
     }
 }
 
+/// Автоподбор кода сейфа: «Сейф 42», попытки не ограничены.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeConfig {
+    /// Шаблон команды: `{code}` заменяется на код из 1..99.
+    #[serde(default = "default_safe_command")]
+    pub command: String,
+    /// Пауза между попытками, секунды.
+    #[serde(default = "default_safe_delay")]
+    pub delay_secs: f64,
+}
+
+fn default_safe_command() -> String {
+    "Сейф {code}".into()
+}
+
+fn default_safe_delay() -> f64 {
+    4.0
+}
+
+impl Default for SafeConfig {
+    fn default() -> Self {
+        Self {
+            command: default_safe_command(),
+            delay_secs: default_safe_delay(),
+        }
+    }
+}
+
+
 /// Автоснятие дохода с бизнеса: команда «Бизнес снять» раз в час.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusinessConfig {
@@ -565,6 +597,7 @@ impl Default for Config {
             bonus_dm: default_bonus_dm(),
             race: RaceConfig::default(),
             business: BusinessConfig::default(),
+            safe: SafeConfig::default(),
             player_name: String::new(),
             base_dir: PathBuf::from("."),
         }

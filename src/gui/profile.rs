@@ -2,11 +2,10 @@ use eframe::egui::{self, *};
 
 use super::App;
 use super::common::*;
-use super::overview::status_card;
 use crate::engine::{Command, Status};
 
-/// Профиль игрока (ответ бота на «Профиль») и статистика казино.
-pub(super) fn profile_page(app: &mut App, ui: &mut egui::Ui, status: &Status) {
+/// Профиль игрока (ответ бота на «Профиль»).
+pub(super) fn profile_page(app: &mut App, ui: &mut egui::Ui, _status: &Status) {
     let profile = app.shared.profile();
     let last = app.shared.last_profile();
 
@@ -81,6 +80,4 @@ pub(super) fn profile_page(app: &mut App, ui: &mut egui::Ui, status: &Status) {
         }
     });
 
-    ui.add_space(12.0);
-    status_card(app, ui, status);
 }

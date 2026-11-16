@@ -71,6 +71,15 @@ pub struct Status {
     /// Сессия в tdata авторизована (можно работать без входа).
     pub authorized: bool,
     pub casino_running: bool,
+    /// Идёт подбор кода сейфа.
+    pub safe_running: bool,
+    /// Сколько попыток «Сейф» сделано и сколько сейфов вскрыто.
+    pub safe_attempts: u64,
+    pub safe_wins: u64,
+    /// Сколько денег нашли в сейфах.
+    pub safe_found: u64,
+    /// Код последней попытки.
+    pub safe_code: u32,
     pub rounds: u64,
     pub wins: u64,
     pub losses_in_row: u32,
@@ -83,6 +92,10 @@ pub struct Status {
 pub enum Command {
     StartCasino,
     StopCasino,
+    /// Запустить подбор кодов «Сейф».
+    StartSafe,
+    /// Остановить подбор кодов «Сейф».
+    StopSafe,
     /// Отправить «Питомец поход» прямо сейчас.
     PetNow,
     /// Обслужить принтер прямо сейчас («Принтер» + заправить + снять).
@@ -123,6 +136,9 @@ pub struct Shared {
     casino_on: AtomicBool,
     casino_gen: AtomicU64,
     casino_cancel: Mutex<Arc<AtomicBool>>,
+    safe_on: AtomicBool,
+    safe_gen: AtomicU64,
+    safe_cancel: Mutex<Arc<AtomicBool>>,
     pet_wake: Notify,
     pet_forced: AtomicBool,
     last_pet: Mutex<Option<i64>>,
@@ -363,6 +379,9 @@ impl Shared {
             casino_on: AtomicBool::new(false),
             casino_gen: AtomicU64::new(0),
             casino_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            safe_on: AtomicBool::new(false),
+            safe_gen: AtomicU64::new(0),
+            safe_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             pet_wake: Notify::new(),
             pet_forced: AtomicBool::new(false),
             last_pet: Mutex::new(state.last_pet_unix),
@@ -1165,6 +1184,21 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                         tokio::spawn(casino_task(shared.clone(), gen, cancel));
                     }
                     Command::StopCasino => stop_casino(&shared, "остановлено пользователем"),
+                    Command::StartSafe => {
+                        if shared.safe_on.swap(true, Ordering::SeqCst) {
+                            continue;
+                        }
+                        let gen = shared.safe_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        *shared.safe_cancel.lock().unwrap() = cancel.clone();
+                        shared.set_status(|s| {
+                            s.safe_running = true;
+                            s.message = "сейф запущен".into();
+                        });
+                        shared.log("[сейф] старт");
+                        tokio::spawn(safe_task(shared.clone(), gen, cancel));
+                    }
+                    Command::StopSafe => stop_safe(&shared, "остановлено пользователем"),
                     Command::PetNow => {
                         shared.pet_forced.store(true, Ordering::SeqCst);
                         shared.pet_wake.notify_waiters();
@@ -1303,6 +1337,120 @@ fn stop_casino(shared: &Shared, reason: &str) {
         s.message = reason.to_string();
     });
     shared.log(format!("[казино] {reason}"));
+}
+
+fn stop_safe(shared: &Shared, reason: &str) {
+    shared.safe_on.store(false, Ordering::SeqCst);
+    shared.safe_gen.fetch_add(1, Ordering::SeqCst);
+    shared.safe_cancel.lock().unwrap().store(true, Ordering::SeqCst);
+    shared.set_status(|s| {
+        s.safe_running = false;
+        s.message = reason.to_string();
+    });
+    shared.log(format!("[сейф] {reason}"));
+}
+
+fn safe_alive(shared: &Shared, gen: u64, cancel: &AtomicBool) -> bool {
+    shared.safe_on.load(Ordering::SeqCst)
+        && shared.safe_gen.load(Ordering::SeqCst) == gen
+        && !cancel.load(Ordering::Relaxed)
+}
+
+/// Перебор кодов сейфа, пока не остановят.
+async fn safe_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
+    let mut bag = crate::safe::Bag::new();
+    let mut previous: Option<u32> = None;
+    let mut fails: u32 = 0;
+
+    'outer: while safe_alive(&shared, gen, &cancel) {
+        let chat = match shared.chat().await {
+            Ok(chat) => {
+                fails = 0;
+                chat
+            }
+            Err(e) => {
+                fails += 1;
+                shared.log(format!("[связь] {e}"));
+                shared.set_status(|s| {
+                    s.connected = false;
+                    s.message = format!("нет связи: {e}");
+                });
+                if fails >= MAX_FAILS {
+                    stop_safe(&shared, "не удалось подключиться");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let cfg = shared.cfg();
+        let code = bag.next(previous);
+        let command = crate::safe::command(&cfg.safe.command, code);
+
+        if !safe_alive(&shared, gen, &cancel) {
+            break 'outer;
+        }
+
+        let guard = chat.peer_lock.lock().await;
+        shared.log(format!("[сейф {code}] → {command}"));
+        let sent = match chat.client.send_message(chat.bot_ref, command.as_str()).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                shared.log(format!("[связь] {e}"));
+                shared.reset_chat().await;
+                drop(guard);
+                continue 'outer;
+            }
+        };
+        previous = Some(code);
+        shared.set_status(|s| {
+            s.safe_code = code;
+            s.safe_attempts += 1;
+            s.last_bot_reply.clear();
+        });
+
+        let timeout = cfg.casino.reply_timeout_secs.max(10);
+        let waited = wait_round(&chat, sent.id(), timeout, &cancel).await;
+        drop(guard);
+
+        match waited {
+            Ok(Wait::Reply(_, text)) => {
+                shared.set_status(|s| s.last_bot_reply = text.clone());
+                match crate::safe::parse(&text) {
+                    crate::safe::Outcome::Win(amount) => {
+                        shared.log(format!("[сейф] вскрыт по коду {code}: {amount}$"));
+                        shared.set_status(|s| {
+                            s.safe_wins += 1;
+                            s.safe_found = s.safe_found.saturating_add(amount);
+                            s.message = format!("сейф вскрыт: {amount}$");
+                        });
+                        previous = None;
+                    }
+                    crate::safe::Outcome::Fail(_) => {
+                        shared.log(format!("[сейф {code}] мимо"));
+                    }
+                    crate::safe::Outcome::Other => {
+                        shared.log("[сейф] ответ не про сейф");
+                    }
+                }
+            }
+            Ok(Wait::Timeout) => {
+                shared.log("[сейф] бот молчит — следующая попытка");
+            }
+            Ok(Wait::Cancelled) => break 'outer,
+            Err(e) => {
+                shared.log(format!("[связь] {e}"));
+                shared.reset_chat().await;
+                continue 'outer;
+            }
+        }
+
+        let delay = cfg.safe.delay_secs.max(1.0);
+        if !pause(Duration::from_secs_f64(delay), &cancel).await {
+            break 'outer;
+        }
+    }
 }
 
 fn alive(shared: &Shared, gen: u64, cancel: &AtomicBool) -> bool {

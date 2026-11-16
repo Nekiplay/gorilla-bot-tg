@@ -19,6 +19,7 @@ mod gui;
 mod mtproxy;
 mod profile;
 mod race;
+mod safe;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

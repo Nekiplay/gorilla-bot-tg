@@ -274,7 +274,7 @@ impl eframe::App for App {
                         Tab::Profile => profile::profile_page(self, ui, &status),
                         Tab::Telegram => telegram::telegram_card(self, ui),
                         Tab::Proxy => proxy::proxy_card(self, ui),
-                        Tab::Casino => casino::casino_card(self, ui, status.casino_running),
+                        Tab::Casino => casino::casino_card(self, ui, &status),
                         Tab::Pet => {
                             let left = self.shared.next_pet_in();
                             let last = self.shared.last_pet();

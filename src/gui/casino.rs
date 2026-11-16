@@ -3,9 +3,10 @@ use eframe::egui::{self, *};
 
 use super::App;
 use super::common::*;
-use crate::engine::Command;
+use crate::engine::{Command, Status};
 
-    pub(super) fn casino_card(app: &mut App, ui: &mut egui::Ui, running: bool) {
+    pub(super) fn casino_card(app: &mut App, ui: &mut egui::Ui, status: &Status) {
+        let running = status.casino_running;
         card(ui, "Казино", |ui| {
             let (label, fill, cmd) = if running {
                 ("Стоп казино", DANGER, Command::StopCasino)
@@ -109,4 +110,64 @@ use crate::engine::Command;
                 ),
             );
         });
+        card(ui, "Сейф", |ui| {
+            let (label, fill, cmd) = if status.safe_running {
+                ("Стоп сейф", DANGER, Command::StopSafe)
+            } else {
+                ("Старт сейф", OK, Command::StartSafe)
+            };
+            if ui
+                .add(
+                    Button::new(RichText::new(label).size(15.0).strong().color(Color32::WHITE))
+                        .fill(fill)
+                        .min_size(Vec2::new(ui.available_width(), 34.0)),
+                )
+                .clicked()
+            {
+                let _ = app.tx.send(cmd);
+            }
+            hint(
+                ui,
+                "перебирает коды 1..99 без повторов; попытки бот не ограничивает",
+            );
+            ui.add_space(2.0);
+            row(ui, "Команда", |ui| {
+                wide_edit(ui, &mut app.cfg.safe.command, "Сейф {code}");
+            });
+            row(ui, "Пауза, с", |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut app.cfg.safe.delay_secs)
+                        .speed(0.1)
+                        .range(1.0..=120.0),
+                );
+            });
+            ui.add_space(4.0);
+            row(ui, "Код", |ui| {
+                if status.safe_attempts == 0 {
+                    ui.label(RichText::new("—").size(13.0).color(TEXT_DIM));
+                } else {
+                    ui.label(
+                        RichText::new(status.safe_code.to_string())
+                            .size(13.0)
+                            .color(TEXT),
+                    );
+                }
+            });
+            row(ui, "Попыток", |ui| {
+                ui.label(RichText::new(status.safe_attempts.to_string()).size(13.0).color(TEXT));
+            });
+            row(ui, "Вскрыто", |ui| {
+                ui.label(RichText::new(status.safe_wins.to_string()).size(13.0).color(TEXT));
+            });
+            row(ui, "Найдено", |ui| {
+                ui.label(
+                    RichText::new(format!("{} $", status.safe_found))
+                        .size(13.0)
+                        .strong()
+                        .color(OK),
+                );
+            });
+        });
+        ui.add_space(12.0);
+        super::overview::status_card(app, ui, status);
     }
