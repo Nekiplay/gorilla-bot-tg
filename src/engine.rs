@@ -1234,6 +1234,10 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
 
             match waited {
                 Ok(Wait::Reply(_, text)) => {
+                    // Ответ разобран — ставка больше не «висит». Без сброса
+                    // проверка в начале цикла нашла бы этот же ответ ещё раз
+                    // и засчитала победу дважды.
+                    pending = None;
                     fails = 0;
                     let step = apply_reply(&shared, &cfg, &mut mg, &text, &cancel).await;
                     // Обновляем плитки сразу после результата, а не к следующей
