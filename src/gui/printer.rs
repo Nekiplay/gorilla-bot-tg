@@ -67,11 +67,11 @@ use crate::engine::Command;
             hint(
                 ui,
                 &format!(
-                    "{} ч {} мин ± {} мин ({}–{} с)",
+                    "{} ч {} мин +0..{} мин ({}–{} с)",
                     interval / 3600,
                     interval % 3600 / 60,
                     jitter / 60,
-                    interval.saturating_sub(jitter),
+                    interval,
                     interval + jitter
                 ),
             );

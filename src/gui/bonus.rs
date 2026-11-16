@@ -54,7 +54,7 @@ use crate::engine::{BonusKind, Command};
                 hint(
                     ui,
                     &format!(
-                        "Если бот не назвал срок — запасные {} мин. Разброс ±{} мин.",
+                        "Если бот не назвал срок — запасные {} мин. Разброс +0..{} мин.",
                         bonus.interval_secs / 60,
                         bonus.jitter_secs / 60
                     ),

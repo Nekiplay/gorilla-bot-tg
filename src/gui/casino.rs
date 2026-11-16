@@ -102,10 +102,10 @@ use crate::engine::{Command, Status};
             hint(
                 ui,
                 &format!(
-                    "ставка растёт в {:.2}× ± {:.0}%, пауза {}–{} с",
+                    "ставка растёт в {:.2}× ± {:.0}%, пауза {}+0..{} с",
                     app.cfg.casino.multiplier,
                     app.cfg.casino.multiplier_jitter * 100.0,
-                    base.saturating_sub(jitter),
+                    base,
                     base + jitter
                 ),
             );

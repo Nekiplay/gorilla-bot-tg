@@ -91,12 +91,12 @@ fn parse_delta(text: &str) -> Option<i64> {
     None
 }
 
-/// Интервал между заездами с разбросом: interval_secs ± interval_jitter_secs.
+/// Интервал между заездами с разбросом: interval_secs + (0..=interval_jitter_secs).
 pub fn interval(cfg: &RaceConfig) -> i64 {
     let base = cfg.interval_secs as i64;
     let jitter = (cfg.interval_jitter_secs as i64).min(base.max(1));
     let secs = if jitter > 0 {
-        rand::rng().random_range(base - jitter..=base + jitter)
+        rand::rng().random_range(base..=base + jitter)
     } else {
         base
     };

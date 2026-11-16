@@ -298,12 +298,12 @@ struct PersistedState {
     next_business_unix: Option<i64>,
 }
 
-/// Интервал до следующего похода с разбросом: interval_secs ± interval_jitter_secs.
+/// Интервал до следующего похода с разбросом: interval_secs + (0..=interval_jitter_secs).
 fn pet_interval(cfg: &crate::config::PetConfig) -> i64 {
     let base = cfg.interval_secs as i64;
     let jitter = (cfg.interval_jitter_secs as i64).min(base.max(1));
     let secs = if jitter > 0 {
-        rand::rng().random_range(base - jitter..=base + jitter)
+        rand::rng().random_range(base..=base + jitter)
     } else {
         base
     };
@@ -311,19 +311,19 @@ fn pet_interval(cfg: &crate::config::PetConfig) -> i64 {
 }
 
 
-/// Интервал до следующей проверки принтера с разбросом: interval_secs ± interval_jitter_secs.
+/// Интервал до следующей проверки принтера с разбросом: interval_secs + (0..=interval_jitter_secs).
 fn printer_interval(cfg: &crate::config::PrinterConfig) -> i64 {
     let base = cfg.interval_secs as i64;
     let jitter = (cfg.interval_jitter_secs as i64).min(base.max(1));
     let secs = if jitter > 0 {
-        rand::rng().random_range(base - jitter..=base + jitter)
+        rand::rng().random_range(base..=base + jitter)
     } else {
         base
     };
     secs.max(1)
 }
 
-/// Интервал до следующей гонки с разбросом: interval_secs ± interval_jitter_secs.
+/// Интервал до следующей гонки с разбросом: interval_secs + (0..=interval_jitter_secs).
 fn race_interval(cfg: &crate::config::RaceConfig) -> i64 {
     race::interval(cfg)
 }
@@ -333,7 +333,7 @@ fn business_interval(cfg: &crate::config::BusinessConfig) -> i64 {
     let base = cfg.interval_secs as i64;
     let jitter = (cfg.interval_jitter_secs as i64).min(base.max(1));
     let secs = if jitter > 0 {
-        rand::rng().random_range((base - jitter).max(1)..=(base + jitter))
+        rand::rng().random_range(base.max(1)..=(base + jitter))
     } else {
         base
     };
@@ -571,7 +571,7 @@ impl Shared {
         let jitter = (bonus.jitter_secs as i64).min((base / 4).max(1));
         let last = self.last_bonus(kind).unwrap_or_else(now_unix);
         let delta = if jitter > 0 {
-            rand::rng().random_range(base - jitter..=base + jitter).max(60)
+            rand::rng().random_range(base..=base + jitter).max(60)
         } else {
             base.max(60)
         };
@@ -2164,13 +2164,13 @@ async fn bonus_once(shared: &Shared, cfg: &Config, kind: BonusKind) -> Result<()
 
         let jitter = (bonus.jitter_secs as i64).min((base / 4).max(1));
         let delta = if jitter > 0 {
-            rand::rng().random_range(base - jitter..=base + jitter).max(60)
+            rand::rng().random_range(base..=base + jitter).max(60)
         } else {
             base.max(60)
         };
         shared.set_next_bonus(kind, now + delta);
         shared.log(format!(
-            "{tag} следующая отправка через {} (±{} мин)",
+            "{tag} следующая отправка через {} (+0..{} мин)",
             fmt_secs(delta),
             jitter / 60
         ));

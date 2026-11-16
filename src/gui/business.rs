@@ -40,7 +40,7 @@ use crate::engine::Command;
             hint(
                 ui,
                 &format!(
-                    "{} ч {} мин ± {} мин",
+                    "{} ч {} мин +0..{} мин",
                     interval / 3_600,
                     (interval % 3_600) / 60,
                     jitter / 60

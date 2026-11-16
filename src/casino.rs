@@ -191,13 +191,13 @@ impl Martingale {
     }
 }
 
-/// Пауза между раундами с разбросом: `round_gap_secs ± round_gap_jitter_secs`.
+/// Пауза между раундами с разбросом: `round_gap_secs + (0..=round_gap_jitter_secs)`.
 /// Разброс не больше самой паузы — она остаётся положительной.
 pub fn round_gap(cfg: &CasinoConfig) -> Duration {
     let base = cfg.round_gap_secs as i64;
     let jitter = (cfg.round_gap_jitter_secs as i64).min(base.max(0));
     let secs = if jitter > 0 {
-        rand::rng().random_range(base - jitter..=base + jitter)
+        rand::rng().random_range(base..=base + jitter)
     } else {
         base
     };

@@ -169,7 +169,7 @@ pub struct CasinoConfig {
     /// Пауза между раундами поверх кулдауна бота, секунды.
     #[serde(default = "default_round_gap")]
     pub round_gap_secs: u64,
-    /// Случайный разброс паузы: фактическая = round_gap_secs ± jitter,
+    /// Случайный разброс паузы: фактическая = round_gap_secs + (0..=jitter),
     /// чтобы бот не видел ровный ритм ставок.
     #[serde(default = "default_round_gap_jitter")]
     pub round_gap_jitter_secs: u64,
@@ -264,8 +264,8 @@ pub struct PetConfig {
     /// Интервал между отправками, секунды (по умолчанию 3600 + 240).
     #[serde(default = "default_pet_interval")]
     pub interval_secs: u64,
-    /// Разброс интервала: фактический = interval_secs ± jitter
-    /// (3840 ± 240 с → от 1 ч 3 мин до 1 ч 7 мин).
+    /// Разброс интервала: фактический = interval_secs + (0..=jitter)
+    /// (3840 + 0..240 с → от 1 ч 4 мин до 1 ч 8 мин).
     #[serde(default = "default_pet_jitter")]
     pub interval_jitter_secs: u64,
     /// Сколько секунд ждать ответ бота.
@@ -334,7 +334,7 @@ pub struct PrinterConfig {
     /// Интервал между проверками/обслуживанием, секунды (по умолчанию 1 час).
     #[serde(default = "default_printer_interval")]
     pub interval_secs: u64,
-    /// Разброс интервала: фактический = interval_secs ± jitter.
+    /// Разброс интервала: фактический = interval_secs + (0..=jitter).
     #[serde(default = "default_printer_jitter")]
     pub interval_jitter_secs: u64,
     /// Сколько секунд ждать ответ бота.
@@ -456,7 +456,7 @@ pub struct RaceConfig {
     /// Интервал между заездами, секунды (по умолчанию 30 минут).
     #[serde(default = "default_race_interval")]
     pub interval_secs: u64,
-    /// Разброс интервала: фактический = interval_secs ± jitter.
+    /// Разброс интервала: фактический = interval_secs + (0..=jitter).
     #[serde(default = "default_race_jitter")]
     pub interval_jitter_secs: u64,
     /// Сколько секунд ждать ответ бота на команду.
@@ -551,7 +551,7 @@ pub struct BusinessConfig {
     /// Интервал между отправками, секунды (по умолчанию 1 час 4 минуты).
     #[serde(default = "default_business_interval")]
     pub interval_secs: u64,
-    /// Разброс интервала: фактический = interval_secs ± jitter.
+    /// Разброс интервала: фактический = interval_secs + (0..=jitter).
     #[serde(default)]
     pub interval_jitter_secs: u64,
     /// Сколько секунд ждать ответ бота на команду.

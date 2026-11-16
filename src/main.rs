@@ -403,7 +403,7 @@ async fn bonus_mode(cfg: &Config) -> Result<(), BoxError> {
             println!("Бот: {}", one_line(&text));
             match crate::engine::parse_bonus_delay(&text) {
                 Some(secs) => println!(
-                    "Следующий бонус по ответу бота: {} мин (разброс ±{} мин)",
+                    "Следующий бонус по ответу бота: {} мин (+0..{} мин)",
                     secs / 60,
                     cfg.bonus.jitter_secs / 60
                 ),
