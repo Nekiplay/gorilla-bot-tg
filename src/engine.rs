@@ -981,6 +981,42 @@ pub(crate) async fn solve_captcha(
     }
 }
 
+/// Сколько ждём подтверждения «проверка пройдена» после нажатия «Готово».
+const CAPTCHA_VERDICT_SECS: u64 = 30;
+
+/// Вердикт бота по капче: `Some(true)` — пройдена, `Some(false)` — не принял,
+/// `None` — ничего не ответил.
+async fn captcha_verdict(
+    client: &Client,
+    bot_ref: PeerRef,
+    bot_id: PeerId,
+    after_id: i32,
+) -> Option<bool> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(CAPTCHA_VERDICT_SECS);
+    loop {
+        if let Some((_, text)) = crate::latest_reply(client, bot_ref, after_id, bot_id)
+            .await
+            .ok()
+            .flatten()
+        {
+            let lower = text.to_lowercase();
+            if lower.contains("проверка пройдена") || lower.contains("капча пройдена") {
+                return Some(true);
+            }
+            if lower.contains("не пройдена")
+                || lower.contains("заблокирован")
+                || lower.contains("неверн")
+            {
+                return Some(false);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Скачивает картинку капчи, ждёт разметки из окна, нажимает кнопки
 /// и дообучает модель на размеченных плитках.
 async fn captcha_gate(
@@ -1062,7 +1098,13 @@ async fn captcha_gate(
     if let Some(done) = captcha.buttons.iter().find(|b| b.is_done()) {
         crate::click_button(client, bot_ref, message_id, &done.data).await?;
     }
-    shared.log("[капча] выбор отправлен");
+    shared.log("[капча] выбор отправлен, ждём подтверждения");
+    let verdict = captcha_verdict(client, bot_ref, bot_id, message_id).await;
+    match verdict {
+        Some(true) => shared.log("[капча] проверка пройдена"),
+        Some(false) => shared.log("[капча] бот не принял ответ — капча не пройдена"),
+        None => shared.log("[капча] подтверждения нет: бот молчит"),
+    }
     shared.set_captcha(None);
 
     // Дообучение: каждая плитка — один пример «нужна/не нужна».
