@@ -37,7 +37,8 @@ pub fn parse_reply(text: &str) -> Outcome {
     if lower.contains("выигр") || lower.contains("побед") {
         return Outcome::Win;
     }
-    if lower.contains("проигр") || lower.contains("выпал") && !lower.contains("выигр") {
+    if lower.contains("проигр") || lower.contains("выпал") && !lower.contains("выигр")
+    {
         return Outcome::Lose;
     }
     Outcome::Unknown(lower)
@@ -186,7 +187,11 @@ impl Martingale {
             self.wins,
             self.losses_in_row,
             self.bet,
-            if self.bet_capped { " (упёрлись в потолок)" } else { "" }
+            if self.bet_capped {
+                " (упёрлись в потолок)"
+            } else {
+                ""
+            }
         )
     }
 }

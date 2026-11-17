@@ -1,0 +1,14 @@
+   Compiling gorilla-bot v0.2.0 (C:\Users\WindowsUser\Documents\GitHub\gorilla-bot)
+warning: variant `Shutdown` is never constructed
+   --> src\engine.rs:135:5
+    |
+100 | pub enum Command {
+    |          ------- variant in this enum
+...
+135 |     Shutdown,
+    |     ^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `gorilla-bot` (bin "gorilla-bot") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 53s

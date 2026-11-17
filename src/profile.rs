@@ -176,10 +176,7 @@ mod tests {
             p.property.get("Денежный принтер").map(String::as_str),
             Some("HP Color LaserJet")
         );
-        assert_eq!(
-            p.registered.as_deref(),
-            Some("18.03.2019, 13:48:11")
-        );
+        assert_eq!(p.registered.as_deref(), Some("18.03.2019, 13:48:11"));
         assert!(p.age.is_some());
     }
 

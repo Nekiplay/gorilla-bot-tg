@@ -1,100 +1,141 @@
-use std::time::Duration;
+//! Бонус: рассылка «Бонус» в канал и в личку боту.
 
-use eframe::egui::{self, *};
-
-use super::App;
-use super::common::*;
+use super::{common, theme, Bot};
 use crate::engine::{BonusKind, Command};
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Context, ParentElement, Styled, Window};
 
-    pub(super) fn bonus_card(
-        app: &mut App,
-        ui: &mut egui::Ui,
-        kind: BonusKind,
-        left: Option<Duration>,
-        last_bonus: Option<i64>,
-    ) {
-        let (title, target_hint) = match kind {
-            BonusKind::Channel => ("Бонус в канал", "gorillabot_double"),
-            BonusKind::Dm => ("Бонус в личку", "realgorillabot"),
-        };
-        let mut send_now = false;
-        {
-            let bonus = match kind {
-                BonusKind::Channel => &mut app.cfg.bonus,
-                BonusKind::Dm => &mut app.cfg.bonus_dm,
-            };
-            card(ui, title, |ui| {
-                ui.checkbox(
-                    &mut bonus.enabled,
-                    RichText::new("Слать «Бонус» по расписанию")
-                        .size(13.0)
-                        .color(TEXT),
-                );
+/// Страница «Бонус».
+pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(bonus_card(bot, window, cx, BonusKind::Channel))
+        .child(bonus_card(bot, window, cx, BonusKind::Dm))
+        .into_any_element()
+}
 
-                row(ui, "Чат / канал", |ui| {
-                    wide_edit(ui, &mut bonus.target, target_hint);
-                });
-                row(ui, "Команда", |ui| {
-                    wide_edit(ui, &mut bonus.command, "Бонус");
-                });
-                row(ui, "Разброс, мин", |ui| {
-                    let mut minutes = (bonus.jitter_secs / 60) as i64;
-                    if ui
-                        .add(egui::DragValue::new(&mut minutes).speed(1.0).range(0..=120))
-                        .changed()
-                    {
-                        bonus.jitter_secs = (minutes.max(0) as u64) * 60;
-                    }
-                });
+/// Карточка одного бонуса.
+fn bonus_card(
+    bot: &mut Bot,
+    window: &mut Window,
+    cx: &mut Context<Bot>,
+    kind: BonusKind,
+) -> AnyElement {
+    let (title, target_hint) = match kind {
+        BonusKind::Channel => ("Бонус в канал", "gorillabot_double"),
+        BonusKind::Dm => ("Бонус в личку", "realgorillabot"),
+    };
+    let target_key = match kind {
+        BonusKind::Channel => "bonus.target",
+        BonusKind::Dm => "bonus_dm.target",
+    };
+    let command_key = match kind {
+        BonusKind::Channel => "bonus.command",
+        BonusKind::Dm => "bonus_dm.command",
+    };
+    let jitter_key = match kind {
+        BonusKind::Channel => "bonus.jitter_secs",
+        BonusKind::Dm => "bonus_dm.jitter_secs",
+    };
+    let flag_key = match kind {
+        BonusKind::Channel => "bonus.enabled",
+        BonusKind::Dm => "bonus_dm.enabled",
+    };
 
-                hint(
-                    ui,
-                    "Срок ищется в любом ответе бота: «12ч», «6 мин. 29 сек.», «через 3 часа».",
-                );
-                hint(
-                    ui,
-                    &format!(
-                        "Если бот не назвал срок — запасные {} мин. Разброс +0..{} мин.",
-                        bonus.interval_secs / 60,
-                        bonus.jitter_secs / 60
-                    ),
-                );
+    let target = bot.field(target_key, window, cx);
+    let command = bot.field(command_key, window, cx);
+    let jitter = bot.field(jitter_key, window, cx);
 
-                ui.add_space(4.0);
-                match last_bonus {
-                    Some(ts) => hint(
-                        ui,
-                        &format!("Последняя отправка: {} ({})", local_hhmm(ts), ago(ts)),
-                    ),
-                    None => hint(ui, "Ещё не отправлялся — уйдёт при старте."),
-                }
-                match left {
-                    Some(d) => {
-                        ui.label(
-                            RichText::new(format!("Следующий бонус через {}", fmt_dur(d)))
-                                .color(ACCENT_LIGHT),
-                        );
-                    }
-                    None => hint(ui, "Автоотправка выключена"),
-                }
+    let (enabled, interval_secs, jitter_secs) = match kind {
+        BonusKind::Channel => (
+            bot.cfg.bonus.enabled,
+            bot.cfg.bonus.interval_secs,
+            bot.cfg.bonus.jitter_secs,
+        ),
+        BonusKind::Dm => (
+            bot.cfg.bonus_dm.enabled,
+            bot.cfg.bonus_dm.interval_secs,
+            bot.cfg.bonus_dm.jitter_secs,
+        ),
+    };
+    let last = bot.shared.last_bonus(kind);
+    let left = bot.shared.next_bonus_in(kind);
+    let hint = format!(
+        "Если бот не назвал срок — запасные {} мин. Разброс +0..{} мин.",
+        interval_secs / 60,
+        (jitter_secs / 60).max(1)
+    );
+    let last_line = match last {
+        Some(ts) => format!(
+            "Последняя отправка: {} ({})",
+            common::local_hhmm(ts),
+            common::ago(Some(ts))
+        ),
+        None => "Ещё не отправлялся — уйдёт при старте.".to_string(),
+    };
+    let next_line = match left {
+        Some(left) => format!("Следующий бонус через {}", common::fmt_dur(left)),
+        None => "Автоотправка выключена".to_string(),
+    };
+    let start_id: &'static str = match kind {
+        BonusKind::Channel => "bonus-now",
+        BonusKind::Dm => "bonus-dm-now",
+    };
+    let start_label = "Отправить сейчас";
 
-                ui.add_space(4.0);
-                if ui
-                    .add(
-                        Button::new("Отправить сейчас")
-                            .min_size(Vec2::new(ui.available_width(), 26.0)),
+    common::card_with(
+        cx,
+        title,
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(bot.flag(flag_key, "Слать «Бонус» по расписанию", enabled, cx))
+            .child(common::field_row(
+                &*cx,
+                "Чат / канал",
+                common::wide_input(&target),
+            ))
+            .child(common::hint(
+                &*cx,
+                format!("Цель по умолчанию: {target_hint}"),
+            ))
+            .child(common::field_row(
+                &*cx,
+                "Команда",
+                common::wide_input(&command),
+            ))
+            .child(common::field_row(
+                &*cx,
+                "Разброс, мин",
+                common::wide_input(&jitter),
+            ))
+            .child(common::hint(
+                &*cx,
+                "Срок ищется в любом ответе бота: «12ч», «6 мин. 29 сек.», «через 3 часа».",
+            ))
+            .child(common::hint(&*cx, hint))
+            .child(common::hint(&*cx, last_line))
+            .child(common::hint(&*cx, next_line).text_color(if left.is_some() {
+                theme::accent_light(&*cx)
+            } else {
+                theme::muted(&*cx)
+            }))
+            .child(
+                h_flex().w_full().child(
+                    bot.primary_action(
+                        start_id,
+                        start_label,
+                        move || match kind {
+                            BonusKind::Channel => Command::BonusNow,
+                            BonusKind::Dm => Command::BonusDmNow,
+                        },
+                        cx,
                     )
-                    .clicked()
-                {
-                    send_now = true;
-                }
-            });
-        }
-        if send_now {
-            let cmd = match kind {
-                BonusKind::Channel => Command::BonusNow,
-                BonusKind::Dm => Command::BonusDmNow,
-            };
-            let _ = app.tx.send(cmd);
-        }
-    }
+                    .w_full(),
+                ),
+            ),
+    )
+    .into_any_element()
+}

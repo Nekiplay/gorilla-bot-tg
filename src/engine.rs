@@ -1,6 +1,6 @@
 //! Движок автоигры: общее состояние, казино и «Питомец поход» по расписанию.
 //!
-//! GUI на egui только показывает состояние и шлёт команды через канал,
+//! GUI на gpui-kit только показывает состояние и шлёт команды через канал,
 //! вся сеть и таймеры живут здесь, в отдельном tokio-рантайме.
 
 use std::path::PathBuf;
@@ -8,21 +8,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use grammers_client::client::{LoginToken, PasswordToken, SignInError, UpdateStream};
+use grammers_client::client::{PasswordToken, SignInError, UpdateStream};
 use grammers_client::sender::SenderPoolFatHandle;
 use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
+use grammers_client::tl;
 use grammers_client::Client;
 use rand::Rng as _;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::casino::{self, Martingale, Outcome};
 use crate::captcha::{self, Captcha};
+use crate::casino::{self, Martingale, Outcome};
 use crate::config::Config;
+use crate::history::{History, Sample};
 use crate::profile::{self, Profile};
 use crate::race::{self, RaceReply};
-use crate::{append_log, data_path, one_line, resolve_chat, wait_reply, Wait, BoxError};
+use crate::{append_log, data_path, one_line, resolve_chat, wait_reply, BoxError, Wait};
 
 /// Файл с временем последней отправки питомца.
 const STATE_FILE: &str = "gorilla_state.json";
@@ -60,7 +62,9 @@ pub enum LoginStage {
 struct LoginConn {
     client: Client,
     conn: Conn,
-    token: Option<LoginToken>,
+    phone: String,
+    /// `phone_code_hash` из `auth.sendCode`: по нему Telegram сверяет код.
+    code_hash: Option<String>,
     password: Option<PasswordToken>,
 }
 
@@ -84,6 +88,9 @@ pub struct Status {
     pub wins: u64,
     pub losses_in_row: u32,
     pub bet: u64,
+    /// Сколько капч пройдено и сколько не принято.
+    pub captcha_solved: u64,
+    pub captcha_failed: u64,
     pub message: String,
     pub last_bot_reply: String,
 }
@@ -115,11 +122,17 @@ pub enum Command {
     /// Запросить профиль игрока у бота.
     ProfileNow,
     /// Отправить код входа на телефон.
-    LoginRequest { phone: String },
+    LoginRequest {
+        phone: String,
+    },
     /// Проверить введённый код из Telegram.
-    LoginCode { code: String },
+    LoginCode {
+        code: String,
+    },
     /// Проверить пароль 2FA.
-    LoginPassword { password: String },
+    LoginPassword {
+        password: String,
+    },
     /// Прервать вход и закрыть соединение.
     LoginCancel,
     /// Сохранить новые настройки в рантайме.
@@ -176,6 +189,10 @@ pub struct Shared {
     captcha_choice: Mutex<Option<(i32, Vec<bool>)>>,
     /// Что сейчас происходит с капчей (подсказка для окна).
     captcha_note: Mutex<String>,
+    /// История метрик для графиков (кольцевой буфер в gorilla_state.json).
+    history: Mutex<Arc<History>>,
+    /// (наличные из профиля, приход, которого профиль ещё не видел).
+    cash_flow: Mutex<(Option<f64>, f64)>,
 }
 
 /// Какой из авто-бонусов: канал или личка бота.
@@ -237,12 +254,34 @@ fn classify_bonus_reply(text: &str) -> BonusReply {
     let lower = text.to_lowercase();
     let delay = parse_bonus_delay(&lower);
     let has_bonus = lower.contains("бонус");
-    let has_reward = ["$", "₽", "руб", "gb", "💵", "💰", "зачислен", "начислен", "получен", "выдан"]
-        .iter()
-        .any(|marker| lower.contains(marker));
-    let refusal = ["не удалось", "не получ", "уже получ", "до получения", "получи через", "попробуйте через", "приходите через", "недоступ", "ошибка", "не выполн"]
-        .iter()
-        .any(|marker| lower.contains(marker));
+    let has_reward = [
+        "$",
+        "₽",
+        "руб",
+        "gb",
+        "💵",
+        "💰",
+        "зачислен",
+        "начислен",
+        "получен",
+        "выдан",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let refusal = [
+        "не удалось",
+        "не получ",
+        "уже получ",
+        "до получения",
+        "получи через",
+        "попробуйте через",
+        "приходите через",
+        "недоступ",
+        "ошибка",
+        "не выполн",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
 
     if has_bonus && has_reward && !refusal {
         return BonusReply::Claimed(delay);
@@ -254,7 +293,6 @@ fn classify_bonus_reply(text: &str) -> BonusReply {
     }
     BonusReply::Unconfirmed
 }
-
 
 struct Session {
     chat: Arc<Chat>,
@@ -296,6 +334,9 @@ struct PersistedState {
     last_business_unix: Option<i64>,
     #[serde(default)]
     next_business_unix: Option<i64>,
+    /// История метрик: у старого файла ключа нет, читается как пустая.
+    #[serde(default)]
+    history: History,
 }
 
 /// Интервал до следующего похода с разбросом: interval_secs + (0..=interval_jitter_secs).
@@ -309,7 +350,6 @@ fn pet_interval(cfg: &crate::config::PetConfig) -> i64 {
     };
     secs.max(1)
 }
-
 
 /// Интервал до следующей проверки принтера с разбросом: interval_secs + (0..=interval_jitter_secs).
 fn printer_interval(cfg: &crate::config::PrinterConfig) -> i64 {
@@ -402,6 +442,8 @@ impl Shared {
             business_forced: AtomicBool::new(false),
             last_business: Mutex::new(state.last_business_unix),
             next_business: Mutex::new(state.next_business_unix),
+            history: Mutex::new(Arc::new(state.history)),
+            cash_flow: Mutex::new((None, 0.0)),
             profile: Mutex::new(None),
             last_profile: Mutex::new(None),
             login: Mutex::new(LoginStage::Idle),
@@ -423,6 +465,63 @@ impl Shared {
 
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone()
+    }
+
+    /// Снимок истории метрик для графиков (дешёвый клон Arc).
+    pub fn history(&self) -> Arc<History> {
+        self.history.lock().unwrap().clone()
+    }
+
+    /// Снимает замер счётчиков и денег профиля и пишет его в историю.
+    pub fn record_sample(&self) {
+        let status = self.status();
+        let profile = self.profile();
+        let sample = Sample {
+            ts: now_unix(),
+            rounds: status.rounds,
+            wins: status.wins,
+            bet: status.bet,
+            safe_attempts: status.safe_attempts,
+            safe_wins: status.safe_wins,
+            safe_found: status.safe_found,
+            captcha_solved: status.captcha_solved,
+            captcha_failed: status.captcha_failed,
+            cash: self.cash_now(profile.as_ref().and_then(|p| p.cash.as_ref())),
+            bank: crate::history::parse_money(profile.as_ref().and_then(|p| p.bank.as_ref())),
+            bitcoins: crate::history::parse_money(
+                profile.as_ref().and_then(|p| p.bitcoins.as_ref()),
+            ),
+        };
+        {
+            let mut guard = self.history.lock().unwrap();
+            let mut next = guard.as_ref().clone();
+            next.push(sample);
+            *guard = Arc::new(next);
+        }
+        self.persist();
+    }
+
+    /// Наличные для графика: значение из профиля плюс приход, который
+    /// профиль ещё не показал. Профиль обновился — приход обнуляем.
+    fn cash_now(&self, raw: Option<&String>) -> Option<f64> {
+        let value = crate::history::parse_money(raw)?;
+        let mut flow = self.cash_flow.lock().unwrap();
+        if flow.0.map_or(true, |base| (base - value).abs() > 0.5) {
+            flow.0 = Some(value);
+            flow.1 = 0.0;
+        }
+        Some(value + flow.1)
+    }
+
+    /// Приход денег: точка графика наличных появляется сразу по факту
+    /// победы в казино или сейфе, похода питомца, снятия с бизнеса/принтера,
+    /// а не на следующем опросе профиля.
+    pub fn note_income(&self, amount: f64) {
+        if !amount.is_finite() || amount <= 0.0 {
+            return;
+        }
+        self.cash_flow.lock().unwrap().1 += amount;
+        self.record_sample();
     }
 
     pub fn set_status(&self, f: impl FnOnce(&mut Status)) {
@@ -509,7 +608,7 @@ impl Shared {
         self.persist();
     }
 
-    /// Пишет gorilla_state.json (время питомца и бонуса).
+    /// Пишет gorilla_state.json (время отправок и история метрик).
     fn persist(&self) {
         let state = PersistedState {
             last_pet_unix: *self.last_pet.lock().unwrap(),
@@ -524,6 +623,7 @@ impl Shared {
             next_race_unix: *self.next_race.lock().unwrap(),
             last_business_unix: *self.last_business.lock().unwrap(),
             next_business_unix: *self.next_business.lock().unwrap(),
+            history: self.history.lock().unwrap().as_ref().clone(),
         };
         if let Err(e) = save_state(&state) {
             self.log(format!("[состояние] не удалось сохранить время: {e}"));
@@ -781,7 +881,6 @@ impl Shared {
         *self.last_profile.lock().unwrap() = Some(now_unix());
     }
 
-
     /// Подключение (или переиспользование) чата с ботом.
     pub(crate) async fn chat(&self) -> Result<Arc<Chat>, BoxError> {
         let mut guard = self.chat_conn.lock().await;
@@ -791,6 +890,7 @@ impl Shared {
 
         let cfg = self.cfg();
         let conn = crate::connect(&cfg, false).await?;
+        self.log(format!("[связь] канал: {}", crate::route_note()));
         let (bot, bot_ref) = match crate::resolve_bot(&conn.0, &cfg.bot_username).await {
             Ok(v) => v,
             Err(e) => {
@@ -833,7 +933,7 @@ impl Shared {
 }
 
 /// Шаг 1: открыть соединение и попросить код на телефон.
-async fn login_request(shared: &Arc<Shared>, phone: String) {
+pub(crate) async fn login_request(shared: &Arc<Shared>, phone: String) {
     let phone = phone.trim().to_string();
     if phone.is_empty() || phone == "+" {
         shared.set_login(LoginStage::Failed(
@@ -855,23 +955,91 @@ async fn login_request(shared: &Arc<Shared>, phone: String) {
         }
     };
 
+    shared.log(format!("[вход] канал: {}", crate::route_note()));
+
     let client = conn.0.clone();
-    match client.request_login_code(&phone, &cfg.api_hash).await {
-        Ok(token) => {
-            *shared.login_conn.lock().await = Some(LoginConn {
-                client,
-                conn,
-                token: Some(token),
-                password: None,
-            });
-            shared.set_login(LoginStage::AwaitingCode);
-        }
+    let request = tl::functions::auth::SendCode {
+        phone_number: phone.clone(),
+        api_id: cfg.api_id,
+        api_hash: cfg.api_hash.clone(),
+        settings: tl::enums::CodeSettings::Settings(tl::types::CodeSettings {
+            allow_flashcall: false,
+            current_number: false,
+            allow_app_hash: false,
+            allow_missed_call: false,
+            allow_firebase: false,
+            unknown_number: false,
+            logout_tokens: None,
+            token: None,
+            app_sandbox: None,
+        }),
+    };
+    let sent = match client.invoke(&request).await {
+        Ok(sent) => sent,
         Err(e) => {
             conn.2.quit();
             let text = format!("не удалось отправить код на {phone}: {e}");
             shared.log(format!("[вход] {text}"));
             shared.set_login(LoginStage::Failed(text));
+            return;
         }
+    };
+    match sent {
+        tl::enums::auth::SentCode::Code(code) => {
+            shared.log(format!(
+                "[вход] Telegram принял запрос кода на {phone}: {}",
+                code_channel(&code.r#type)
+            ));
+            *shared.login_conn.lock().await = Some(LoginConn {
+                client,
+                conn,
+                phone,
+                code_hash: Some(code.phone_code_hash),
+                password: None,
+            });
+            shared.set_login(LoginStage::AwaitingCode);
+        }
+        tl::enums::auth::SentCode::Success(_) => {
+            conn.2.quit();
+            shared.log("[вход] этот номер уже авторизован, код не нужен");
+            shared.set_login(LoginStage::Failed(
+                "Номер уже авторизован: сессия готова, вход не нужен".into(),
+            ));
+        }
+        tl::enums::auth::SentCode::PaymentRequired(_) => {
+            conn.2.quit();
+            shared.log("[вход] Telegram требует оплату за код");
+            shared.set_login(LoginStage::Failed(
+                "Telegram требует оплату за отправку кода".into(),
+            ));
+        }
+    }
+}
+
+/// Куда Telegram обещал прислать код — чтобы было понятно, чего ждать.
+fn code_channel(kind: &tl::enums::auth::SentCodeType) -> String {
+    use tl::enums::auth::SentCodeType as T;
+    match kind {
+        T::App(x) => format!(
+            "код из {} цифр уходит в приложение Telegram (чат «Telegram» от 777000), не по SMS",
+            x.length
+        ),
+        T::Sms(x) => format!("SMS из {} цифр на этот номер", x.length),
+        T::Call(x) => format!(
+            "Telegram позвонит и продиктует {} цифр — ждать звонок",
+            x.length
+        ),
+        T::FlashCall(_) => "жду звонок: код — номер звонящего".to_string(),
+        T::MissedCall(_) => "жду «непринятый» звонок с кодом".to_string(),
+        T::EmailCode(x) => format!("код из {} цифр на e-mail", x.length),
+        T::SetUpEmailRequired(_) => "Telegram требует привязать e-mail".to_string(),
+        T::FragmentSms(x) => format!("SMS через Fragment из {} цифр", x.length),
+        T::FirebaseSms(_) => "Firebase-SMS (этим клиентом не поддерживается)".to_string(),
+        T::SmsWord(x) => match &x.beginning {
+            Some(beginning) => format!("SMS со словом-кодом, начинается на «{beginning}»"),
+            None => "SMS со словом-кодом".to_string(),
+        },
+        T::SmsPhrase(_) => "SMS с фразой-кодом".to_string(),
     }
 }
 
@@ -886,29 +1054,54 @@ async fn login_code(shared: &Arc<Shared>, code: String) {
         ));
         return;
     };
-    let Some(token) = entry.token.take() else {
+    let Some(code_hash) = entry.code_hash.clone() else {
         drop(guard);
         shared.set_login(LoginStage::Failed("Отправь код заново".into()));
         return;
     };
 
-    match entry.client.sign_in(&token, &code).await {
-        Ok(_) => {
+    let request = tl::functions::auth::SignIn {
+        phone_number: entry.phone.clone(),
+        phone_code_hash: code_hash,
+        phone_code: Some(code),
+        email_verification: None,
+    };
+    match entry.client.invoke(&request).await {
+        Ok(tl::enums::auth::Authorization::Authorization(_)) => {
             let entry = guard.take().expect("соединение входа на месте");
             drop(guard);
             login_success(shared, entry).await;
         }
-        Err(SignInError::PasswordRequired(password)) => {
-            entry.password = Some(password);
+        Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => {
             drop(guard);
-            shared.log("[вход] Telegram просит пароль 2FA");
-            shared.set_login(LoginStage::AwaitingPassword(String::new()));
+            shared.log("[вход] такого номера нет в Telegram");
+            shared.set_login(LoginStage::Failed(
+                "Номер не зарегистрирован в Telegram".into(),
+            ));
         }
-        Err(e) => {
-            entry.token = Some(token);
+        Err(err) if err.is("SESSION_PASSWORD_NEEDED") => {
+            match entry
+                .client
+                .invoke(&tl::functions::account::GetPassword {})
+                .await
+            {
+                Ok(tl::enums::account::Password::Password(password)) => {
+                    entry.password = Some(PasswordToken::new(password));
+                    drop(guard);
+                    shared.log("[вход] Telegram просит пароль 2FA");
+                    shared.set_login(LoginStage::AwaitingPassword(String::new()));
+                }
+                Err(e) => {
+                    drop(guard);
+                    shared.log(format!("[вход] пароль 2FA не запросить: {e}"));
+                    shared.set_login(LoginStage::Failed(format!("Пароль 2FA: {e}")));
+                }
+            }
+        }
+        Err(err) => {
             drop(guard);
-            shared.log(format!("[вход] код не принят: {e}"));
-            shared.set_login(LoginStage::Failed(format!("Код не принят: {e}")));
+            shared.log(format!("[вход] код не принят: {err}"));
+            shared.set_login(LoginStage::Failed(format!("Код не принят: {err}")));
         }
     }
 }
@@ -934,6 +1127,12 @@ async fn login_password(shared: &Arc<Shared>, password: String) {
             let entry = guard.take().expect("соединение входа на месте");
             drop(guard);
             login_success(shared, entry).await;
+        }
+        Err(SignInError::InvalidPassword(again)) => {
+            entry.password = Some(again);
+            drop(guard);
+            shared.log("[вход] пароль не принят");
+            shared.set_login(LoginStage::Failed("Пароль не принят".into()));
         }
         Err(e) => {
             drop(guard);
@@ -1019,7 +1218,8 @@ async fn captcha_verdict(
             .flatten()
         {
             let lower = text.to_lowercase();
-            if lower.contains("проверка пройдена") || lower.contains("капча пройдена") {
+            if lower.contains("проверка пройдена") || lower.contains("капча пройдена")
+            {
                 return Some(true);
             }
             if lower.contains("не пройдена")
@@ -1142,6 +1342,15 @@ async fn captcha_gate(
     shared.log("[капча] выбор отправлен, ждём подтверждения");
     let verdict = captcha_verdict(client, bot_ref, bot_id, message_id).await;
     match verdict {
+        Some(true) => {
+            shared.set_status(|s| s.captcha_solved += 1);
+        }
+        Some(false) => {
+            shared.set_status(|s| s.captcha_failed += 1);
+        }
+        None => {}
+    }
+    match verdict {
         Some(true) => shared.log("[капча] проверка пройдена"),
         Some(false) => shared.log("[капча] бот не принял ответ — капча не пройдена"),
         None => shared.log("[капча] подтверждения нет: бот молчит"),
@@ -1152,8 +1361,12 @@ async fn captcha_gate(
     let mut added = 0usize;
     for (index, tile) in captcha.tiles.iter().enumerate() {
         let needed = chosen.get(index).copied().unwrap_or(false);
-        if captcha::remember(&dir, &captcha::features(tile, captcha.tile_w, captcha.tile_h), needed)
-            .is_ok()
+        if captcha::remember(
+            &dir,
+            &captcha::features(tile, captcha.tile_w, captcha.tile_h),
+            needed,
+        )
+        .is_ok()
         {
             added += 1;
         }
@@ -1188,6 +1401,7 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
             spawn_bonus(shared.clone(), BonusKind::Dm);
             spawn_race(shared.clone());
             spawn_business(shared.clone());
+            spawn_history(shared.clone());
 
             while let Some(cmd) = rx.recv().await {
                 match cmd {
@@ -1195,7 +1409,7 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                         if shared.casino_on.swap(true, Ordering::SeqCst) {
                             continue;
                         }
-                        let gen = shared.casino_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        let generation = shared.casino_gen.fetch_add(1, Ordering::SeqCst) + 1;
                         let cancel = Arc::new(AtomicBool::new(false));
                         *shared.casino_cancel.lock().unwrap() = cancel.clone();
                         shared.set_status(|s| {
@@ -1203,14 +1417,14 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                             s.message = "казино запущено".into();
                         });
                         shared.log("[казино] старт");
-                        tokio::spawn(casino_task(shared.clone(), gen, cancel));
+                        tokio::spawn(casino_task(shared.clone(), generation, cancel));
                     }
                     Command::StopCasino => stop_casino(&shared, "остановлено пользователем"),
                     Command::StartSafe => {
                         if shared.safe_on.swap(true, Ordering::SeqCst) {
                             continue;
                         }
-                        let gen = shared.safe_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        let generation = shared.safe_gen.fetch_add(1, Ordering::SeqCst) + 1;
                         let cancel = Arc::new(AtomicBool::new(false));
                         *shared.safe_cancel.lock().unwrap() = cancel.clone();
                         shared.set_status(|s| {
@@ -1218,7 +1432,7 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                             s.message = "сейф запущен".into();
                         });
                         shared.log("[сейф] старт");
-                        tokio::spawn(safe_task(shared.clone(), gen, cancel));
+                        tokio::spawn(safe_task(shared.clone(), generation, cancel));
                     }
                     Command::StopSafe => stop_safe(&shared, "остановлено пользователем"),
                     Command::PetNow => {
@@ -1291,7 +1505,8 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                             let old = shared.cfg.lock().unwrap();
                             old.printer.enabled != cfg.printer.enabled
                                 || old.printer.interval_secs != cfg.printer.interval_secs
-                                || old.printer.interval_jitter_secs != cfg.printer.interval_jitter_secs
+                                || old.printer.interval_jitter_secs
+                                    != cfg.printer.interval_jitter_secs
                         };
                         let bonus_changed = {
                             let old = shared.cfg.lock().unwrap();
@@ -1353,7 +1568,11 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
 fn stop_casino(shared: &Shared, reason: &str) {
     shared.casino_on.store(false, Ordering::SeqCst);
     shared.casino_gen.fetch_add(1, Ordering::SeqCst);
-    shared.casino_cancel.lock().unwrap().store(true, Ordering::SeqCst);
+    shared
+        .casino_cancel
+        .lock()
+        .unwrap()
+        .store(true, Ordering::SeqCst);
     shared.set_status(|s| {
         s.casino_running = false;
         s.message = reason.to_string();
@@ -1364,7 +1583,11 @@ fn stop_casino(shared: &Shared, reason: &str) {
 fn stop_safe(shared: &Shared, reason: &str) {
     shared.safe_on.store(false, Ordering::SeqCst);
     shared.safe_gen.fetch_add(1, Ordering::SeqCst);
-    shared.safe_cancel.lock().unwrap().store(true, Ordering::SeqCst);
+    shared
+        .safe_cancel
+        .lock()
+        .unwrap()
+        .store(true, Ordering::SeqCst);
     shared.set_status(|s| {
         s.safe_running = false;
         s.message = reason.to_string();
@@ -1372,19 +1595,19 @@ fn stop_safe(shared: &Shared, reason: &str) {
     shared.log(format!("[сейф] {reason}"));
 }
 
-fn safe_alive(shared: &Shared, gen: u64, cancel: &AtomicBool) -> bool {
+fn safe_alive(shared: &Shared, generation: u64, cancel: &AtomicBool) -> bool {
     shared.safe_on.load(Ordering::SeqCst)
-        && shared.safe_gen.load(Ordering::SeqCst) == gen
+        && shared.safe_gen.load(Ordering::SeqCst) == generation
         && !cancel.load(Ordering::Relaxed)
 }
 
 /// Перебор кодов сейфа, пока не остановят.
-async fn safe_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
+async fn safe_task(shared: Arc<Shared>, generation: u64, cancel: Arc<AtomicBool>) {
     let mut bag = crate::safe::Bag::new();
     let mut previous: Option<u32> = None;
     let mut fails: u32 = 0;
 
-    'outer: while safe_alive(&shared, gen, &cancel) {
+    'outer: while safe_alive(&shared, generation, &cancel) {
         let chat = match shared.chat().await {
             Ok(chat) => {
                 fails = 0;
@@ -1413,13 +1636,17 @@ async fn safe_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
         };
         let command = crate::safe::command(&cfg.safe.command, code);
 
-        if !safe_alive(&shared, gen, &cancel) {
+        if !safe_alive(&shared, generation, &cancel) {
             break 'outer;
         }
 
         let guard = chat.peer_lock.lock().await;
         shared.log(format!("[сейф {code}] → {command}"));
-        let sent = match chat.client.send_message(chat.bot_ref, command.as_str()).await {
+        let sent = match chat
+            .client
+            .send_message(chat.bot_ref, command.as_str())
+            .await
+        {
             Ok(msg) => msg,
             Err(e) => {
                 shared.log(format!("[связь] {e}"));
@@ -1445,6 +1672,7 @@ async fn safe_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
                 match crate::safe::parse(&text) {
                     crate::safe::Outcome::Win(amount) => {
                         shared.log(format!("[сейф] вскрыт по коду {code}: {amount}$"));
+                        shared.note_income(amount as f64);
                         shared.set_status(|s| {
                             s.safe_wins += 1;
                             s.safe_found = s.safe_found.saturating_add(amount);
@@ -1478,9 +1706,9 @@ async fn safe_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
     }
 }
 
-fn alive(shared: &Shared, gen: u64, cancel: &AtomicBool) -> bool {
+fn alive(shared: &Shared, generation: u64, cancel: &AtomicBool) -> bool {
     shared.casino_on.load(Ordering::SeqCst)
-        && shared.casino_gen.load(Ordering::SeqCst) == gen
+        && shared.casino_gen.load(Ordering::SeqCst) == generation
         && !cancel.load(Ordering::Relaxed)
 }
 
@@ -1500,12 +1728,12 @@ async fn pause(d: Duration, cancel: &AtomicBool) -> bool {
 }
 
 /// Игровой цикл казино до остановки/лимита/обрыва связи.
-async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
+async fn casino_task(shared: Arc<Shared>, generation: u64, cancel: Arc<AtomicBool>) {
     let mut mg = Martingale::new(&shared.cfg().casino);
     let mut pending: Option<i32> = None;
     let mut fails: u32 = 0;
 
-    'outer: while alive(&shared, gen, &cancel) {
+    'outer: while alive(&shared, generation, &cancel) {
         mg.apply_config(&shared.cfg().casino);
         let chat = match shared.chat().await {
             Ok(chat) => {
@@ -1532,7 +1760,7 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
         let mut resends = 0u32;
 
         loop {
-            if !alive(&shared, gen, &cancel) {
+            if !alive(&shared, generation, &cancel) {
                 break 'outer;
             }
             let cfg = shared.cfg();
@@ -1583,12 +1811,16 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
             let bet = mg.current_bet();
             let command = cfg.casino.command.replace("{bet}", &bet.to_string());
 
-            if !alive(&shared, gen, &cancel) {
+            if !alive(&shared, generation, &cancel) {
                 break 'outer;
             }
             let guard = chat.peer_lock.lock().await;
             shared.log(format!("[ставка {bet}] → {command}"));
-            let sent = match chat.client.send_message(chat.bot_ref, command.as_str()).await {
+            let sent = match chat
+                .client
+                .send_message(chat.bot_ref, command.as_str())
+                .await
+            {
                 Ok(msg) => msg,
                 Err(e) => {
                     drop(guard);
@@ -1616,7 +1848,8 @@ async fn casino_task(shared: Arc<Shared>, gen: u64, cancel: Arc<AtomicBool>) {
                 s.last_bot_reply.clear();
             });
 
-            let mut waited = wait_round(&chat, sent.id(), cfg.casino.reply_timeout_secs, &cancel).await;
+            let mut waited =
+                wait_round(&chat, sent.id(), cfg.casino.reply_timeout_secs, &cancel).await;
             // Бот может ответить позже таймаута (очередь на его стороне):
             // ждём ещё пару таких же окон, прежде чем сдаться.
             let mut attempt = 1;
@@ -1726,12 +1959,7 @@ async fn wait_round(
 
 /// Дожидается результата ставки, отправленной перед остановкой казино,
 /// и обновляет статистику (флаг отмены здесь намеренно игнорируется).
-async fn settled_after_stop(
-    shared: &Arc<Shared>,
-    chat: &Chat,
-    sent_id: i32,
-    mg: &mut Martingale,
-) {
+async fn settled_after_stop(shared: &Arc<Shared>, chat: &Chat, sent_id: i32, mg: &mut Martingale) {
     shared.log("[казино] жду результат последней ставки перед остановкой");
     let never = AtomicBool::new(false);
     let cfg = shared.cfg();
@@ -1769,8 +1997,14 @@ async fn apply_reply(
 
     match casino::parse_reply(text) {
         Outcome::Win => {
+            if let Some(sum) = credited_amount(text) {
+                shared.note_income(sum);
+            }
             mg.on_win();
-            shared.log(format!("[казино] выигрыш, ставка сброшена до {}", mg.current_bet()));
+            shared.log(format!(
+                "[казино] выигрыш, ставка сброшена до {}",
+                mg.current_bet()
+            ));
             if !pause(casino::round_gap(&cfg.casino), cancel).await {
                 return Step::Stop("остановлено пользователем".into());
             }
@@ -1806,6 +2040,16 @@ async fn apply_reply(
 }
 
 /// Таймер питомца: спит до ближайшего срока и отправляет команду.
+/// Замер истории раз в минуту: графики копят данные, пока движок жив.
+fn spawn_history(shared: Arc<Shared>) {
+    tokio::spawn(async move {
+        loop {
+            shared.record_sample();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 fn spawn_pet(shared: Arc<Shared>) {
     tokio::spawn(async move {
         loop {
@@ -1830,11 +2074,48 @@ fn spawn_pet(shared: Arc<Shared>) {
                 }
             }
 
-            if let Err(e) = pet_once(&shared, &cfg).await {
-                shared.log(format!("[питомец] ошибка: {e}"));
-                shared.reset_chat().await;
-                // Не долбим бота каждую секунду при проблемах со связью.
-                tokio::time::sleep(Duration::from_secs(60)).await;
+            match pet_once(&shared, &cfg).await {
+                Ok(PetTrip::Started { sent_id }) => {
+                    // В карточке питомца показываем, сколько ещё ждать возврата.
+                    shared.set_next_pet(now_unix() + PET_TRIP_WAIT as i64);
+                    shared.log(format!(
+                        "[питомец] поход начат — жду сообщение о возврате (до {})",
+                        fmt_secs(PET_TRIP_WAIT as i64)
+                    ));
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(PET_TRIP_WAIT);
+                    match pet_wait_return(&shared, sent_id, deadline).await {
+                        Ok(Some(text)) => {
+                            let now = now_unix();
+                            shared.set_status(|s| s.last_bot_reply = one_line(&text));
+                            shared.log(format!("[питомец] поход завершён: {}", one_line(&text)));
+                            if let Some(sum) = credited_amount(&text) {
+                                shared.note_income(sum);
+                            }
+                            // Вернулся — следующий поход по интервалу из настроек
+                            // (interval_secs + разброс), как и раньше.
+                            shared.set_last_pet(now);
+                        }
+                        Ok(None) => {
+                            shared.log(format!(
+                                "[питомец] сообщения о возврате нет за {} — повторю поход",
+                                fmt_secs(PET_TRIP_WAIT as i64)
+                            ));
+                            shared.set_next_pet(now_unix() + PET_TRIP_MISSED as i64);
+                        }
+                        Err(e) => {
+                            shared.log(format!("[питомец] ожидание возврата: {e}"));
+                            shared.reset_chat().await;
+                            shared.set_next_pet(now_unix() + PET_TRIP_MISSED as i64);
+                        }
+                    }
+                }
+                Ok(PetTrip::Silent) => {}
+                Err(e) => {
+                    shared.log(format!("[питомец] ошибка: {e}"));
+                    shared.reset_chat().await;
+                    // Не долбим бота каждую секунду при проблемах со связью.
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
             }
         }
     });
@@ -1844,10 +2125,7 @@ fn spawn_pet(shared: Arc<Shared>) {
 /// «команда:» — «Питомец покормить», «Питомец поиграть» и т.п.
 /// Список частных случаев не нужен: берём то, что назвал бот.
 pub(crate) fn pet_prep_command(reply: &str) -> Option<String> {
-    let after = reply
-        .find("команда:")
-        .or_else(|| reply.find("Команда:"))? 
-        + "команда:".len();
+    let after = reply.find("команда:").or_else(|| reply.find("Команда:"))? + "команда:".len();
     let tail = &reply[after..];
     let open = tail.find('«')?;
     let rest = &tail[open..];
@@ -1860,11 +2138,19 @@ pub(crate) fn pet_prep_command(reply: &str) -> Option<String> {
     }
 }
 
-async fn pet_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
+/// Чем закончился поход: начался (бот ответил) или бот промолчал.
+enum PetTrip {
+    Started { sent_id: i32 },
+    Silent,
+}
+
+async fn pet_once(shared: &Shared, cfg: &Config) -> Result<PetTrip, BoxError> {
     let chat = shared.chat().await?;
 
-    let mut reply =
+    let first =
         pet_send_confirmed(shared, &chat, &cfg.pet.command, cfg.pet.reply_timeout_secs).await?;
+    let sent_id = first.id;
+    let mut reply = first.reply;
 
     // Бот перед походом может потребовать подготовку — то «питомец покормить»,
     // то «питомец поиграть». Команду он называет сам в кавычках после
@@ -1880,16 +2166,15 @@ async fn pet_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
         shared.log(format!("[питомец] бот просит подготовку → {prep}"));
         pet_send_confirmed(shared, &chat, &prep, cfg.pet.reply_timeout_secs).await?;
         reply = pet_send_confirmed(shared, &chat, &cfg.pet.command, cfg.pet.reply_timeout_secs)
-            .await?;
+            .await?
+            .reply;
         steps += 1;
     }
 
     match reply {
-        // Бот ответил — поход состоялся, следующий через интервал.
-        Some(_) => {
-            shared.set_last_pet(now_unix());
-            Ok(())
-        }
+        // Бот ответил — поход начался. Таймер не двигаем: ждём сообщение
+        // «ваш питомец вернулся из похода, зачислено …», по нему и считаем.
+        Some(_) => Ok(PetTrip::Started { sent_id }),
         // Бот промолчал: «последний поход» не двигаем, повторяем скоро —
         // иначе таймер уйдёт на полный интервал из-за потерянной команды.
         None => {
@@ -1898,7 +2183,53 @@ async fn pet_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
                 fmt_secs(PET_RETRY_SOON as i64)
             ));
             shared.set_next_pet(now_unix() + PET_RETRY_SOON as i64);
-            Ok(())
+            Ok(PetTrip::Silent)
+        }
+    }
+}
+
+/// Сообщение о возврате питомца: «ваш питомец вернулся из похода, зачислено …».
+pub(crate) fn pet_is_return(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    (lower.contains("вернулся") && lower.contains("поход"))
+        || (lower.contains("питомец") && lower.contains("зачислено"))
+}
+
+/// Ждёт в чате сообщение о возврате питомца до `deadline`.
+/// `after_id` — id нашей команды похода: старые сообщения игнорируются.
+async fn pet_wait_return(
+    shared: &Shared,
+    sent_id: i32,
+    deadline: tokio::time::Instant,
+) -> Result<Option<String>, BoxError> {
+    let chat = shared.chat().await?;
+    let cancel = AtomicBool::new(false);
+    let mut since = sent_id;
+
+    loop {
+        let mut none: Option<UpdateStream> = None;
+        let waited = wait_reply(
+            &chat.client,
+            &mut none,
+            chat.bot_ref,
+            chat.bot_id,
+            since,
+            deadline,
+            &cancel,
+            true,
+        )
+        .await?;
+        match waited {
+            Wait::Reply(id, text) => {
+                since = id;
+                if pet_is_return(&text) {
+                    return Ok(Some(text));
+                }
+                // Прочие сообщения бота («питомец отправился в поход») — не возврат.
+                shared.set_status(|s| s.last_bot_reply = one_line(&text));
+                shared.log(format!("[питомец] {}", one_line(&text)));
+            }
+            Wait::Timeout | Wait::Cancelled => return Ok(None),
         }
     }
 }
@@ -1965,7 +2296,6 @@ const BONUS_RETRY_SOON: u64 = 5 * 60;
 /// текст другой. Поэтому парсер не цепляется за конкретные слова и статус, а
 /// просто собирает все пары «число + единица времени». Суммы денег, GB, стрики
 /// и множители отбрасываются: у них нет единиц времени.
-
 
 pub(crate) fn parse_bonus_delay(text: &str) -> Option<u64> {
     // Слишком маленькие значения — это не срок, а мусор вроде «1 раз».
@@ -2076,10 +2406,7 @@ async fn bonus_once(shared: &Shared, cfg: &Config, kind: BonusKind) -> Result<()
     let cancel = AtomicBool::new(false);
     let mut after_id: Option<i32> = None;
 
-    shared.log(format!(
-        "{tag} → «{}» в «{}»",
-        bonus.command, bonus.target
-    ));
+    shared.log(format!("{tag} → «{}» в «{}»", bonus.command, bonus.target));
     for attempt in 1..=BONUS_ATTEMPTS {
         // Лок держим только на свою попытку: паузы между повторами не
         // должны блокировать казино и питомца в том же чате.
@@ -2101,8 +2428,7 @@ async fn bonus_once(shared: &Shared, cfg: &Config, kind: BonusKind) -> Result<()
             // Ответ на любую из попыток считаем ответом на команду.
             // Ignore already-consumed replies on later retry attempts.
             let after = after_id.unwrap_or(sent.id());
-            let deadline =
-                tokio::time::Instant::now() + Duration::from_secs(BONUS_REPLY_TIMEOUT);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(BONUS_REPLY_TIMEOUT);
             wait_reply(
                 &chat.client,
                 &mut none,
@@ -2126,15 +2452,24 @@ async fn bonus_once(shared: &Shared, cfg: &Config, kind: BonusKind) -> Result<()
                 shared.log(format!("{tag} бот: {line}"));
                 match classify_bonus_reply(&text) {
                     BonusReply::Claimed(Some(secs)) => {
-                        shared.log(format!("{tag} награда подтверждена, бот назвал срок: {}", fmt_secs(secs as i64)));
+                        shared.log(format!(
+                            "{tag} награда подтверждена, бот назвал срок: {}",
+                            fmt_secs(secs as i64)
+                        ));
                         secs as i64
                     }
                     BonusReply::Claimed(None) => {
-                        shared.log(format!("{tag} награда подтверждена, беру интервал {}", fmt_secs(bonus.interval_secs as i64)));
+                        shared.log(format!(
+                            "{tag} награда подтверждена, беру интервал {}",
+                            fmt_secs(bonus.interval_secs as i64)
+                        ));
                         bonus.interval_secs as i64
                     }
                     BonusReply::Cooldown(secs) => {
-                        shared.log(format!("{tag} награда не выдана — повтор после кулдауна {}", fmt_secs(secs as i64)));
+                        shared.log(format!(
+                            "{tag} награда не выдана — повтор после кулдауна {}",
+                            fmt_secs(secs as i64)
+                        ));
                         shared.set_next_bonus(kind, now_unix() + secs.max(60) as i64);
                         return Ok(());
                     }
@@ -2219,12 +2554,16 @@ async fn bonus_peer(
         Ok(peer) => peer,
         Err(first) => {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            resolve_chat(client, target).await.map_err(|second| {
-                BoxError::from(format!("{first}; повтор: {second}"))
-            })?
+            resolve_chat(client, target)
+                .await
+                .map_err(|second| BoxError::from(format!("{first}; повтор: {second}")))?
         }
     };
-    shared.log(format!("{} чат найден: «{target}» (id {})", kind.tag(), peer.id));
+    shared.log(format!(
+        "{} чат найден: «{target}» (id {})",
+        kind.tag(),
+        peer.id
+    ));
     *guard = Some((target.to_string(), peer));
     Ok(peer)
 }
@@ -2235,7 +2574,7 @@ async fn pet_send(
     chat: &Chat,
     cmd: &str,
     timeout_secs: u64,
-) -> Result<Option<String>, BoxError> {
+) -> Result<PetSent, BoxError> {
     // Лок на одну отправку: паузы между повторами не держат казино и бонус.
     let _guard = chat.peer_lock.lock().await;
     shared.log(format!("[питомец] → {cmd}"));
@@ -2256,17 +2595,21 @@ async fn pet_send(
     )
     .await;
 
+    let id = sent.id();
     match waited {
         Ok(Wait::Reply(_, text)) => {
             shared.set_status(|s| s.last_bot_reply = one_line(&text));
             shared.log(format!("[питомец] {}", one_line(&text)));
-            Ok(Some(text))
+            Ok(PetSent {
+                id,
+                reply: Some(text),
+            })
         }
         Ok(Wait::Timeout) => {
             shared.log("[питомец] ответ не пришёл за отведённое время");
-            Ok(None)
+            Ok(PetSent { id, reply: None })
         }
-        Ok(Wait::Cancelled) => Ok(None),
+        Ok(Wait::Cancelled) => Ok(PetSent { id, reply: None }),
         Err(e) => {
             shared.log(format!("[питомец] {e}"));
             shared.reset_chat().await;
@@ -2274,23 +2617,38 @@ async fn pet_send(
         }
     }
 }
+/// Чем закончилась отправка команды питомцу. `id` — id нашего сообщения:
+/// сообщения о возврате ищем только новее него, чтобы не поймать прошлый поход.
+struct PetSent {
+    id: i32,
+    reply: Option<String>,
+}
+
 /// Сколько раз повторяем команду питомцу, если бот молчит.
 const PET_ATTEMPTS: u32 = 3;
 /// Пауза перед повтором команды питомцу.
 const PET_RETRY_GAP: u64 = 25;
 /// Бот так и не ответил — повторяем скоро, а не через полный интервал.
 const PET_RETRY_SOON: u64 = 5 * 60;
+/// Сколько ждём сообщение «питомец вернулся из похода» после отправки.
+const PET_TRIP_WAIT: u64 = 3 * 60 * 60;
+/// Сообщения о возврате так и не было — пробуем поход снова через это время.
+const PET_TRIP_MISSED: u64 = 10 * 60;
 
-/// Шлёт команду питомцу, пока бот не ответит. `None` — так и не ответил.
+/// Шлёт команду питомцу, пока бот не ответит. `reply: None` — так и не ответил.
 async fn pet_send_confirmed(
     shared: &Shared,
     chat: &Chat,
     cmd: &str,
     timeout_secs: u64,
-) -> Result<Option<String>, BoxError> {
+) -> Result<PetSent, BoxError> {
+    let mut last = None;
     for attempt in 1..=PET_ATTEMPTS {
-        if let Some(text) = pet_send(shared, chat, cmd, timeout_secs).await? {
-            return Ok(Some(text));
+        let sent = pet_send(shared, chat, cmd, timeout_secs).await?;
+        let answered = sent.reply.is_some();
+        last = Some(sent);
+        if answered {
+            break;
         }
         if attempt < PET_ATTEMPTS {
             shared.log(format!(
@@ -2299,7 +2657,7 @@ async fn pet_send_confirmed(
             tokio::time::sleep(Duration::from_secs(PET_RETRY_GAP)).await;
         }
     }
-    Ok(None)
+    Ok(last.expect("PET_ATTEMPTS > 0"))
 }
 
 /// Разбор статуса принтера из ответа бота:
@@ -2381,7 +2739,9 @@ fn spawn_printer(shared: Arc<Shared>) {
 
             let cfg = shared.cfg();
             if refill_only || withdraw_only {
-                if let Err(e) = printer_direct_actions(&shared, &cfg, refill_only, withdraw_only).await {
+                if let Err(e) =
+                    printer_direct_actions(&shared, &cfg, refill_only, withdraw_only).await
+                {
                     shared.log(format!("[принтер] ошибка: {e}"));
                     shared.reset_chat().await;
                 }
@@ -2429,13 +2789,14 @@ async fn printer_direct_actions(
         if do_refill {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        printer_send_confirmed(
+        let reply = printer_send_confirmed(
             shared,
             &chat,
             cfg.printer.withdraw_command.trim(),
             cfg.printer.reply_timeout_secs,
         )
         .await?;
+        credit_reply(shared, reply.as_deref(), "[принтер]");
     }
     Ok(())
 }
@@ -2477,7 +2838,10 @@ pub(crate) async fn printer_once(shared: &Shared, cfg: &Config) -> Result<(), Bo
                 cfg.printer.refill_below_percent, cfg.printer.refill_command
             ));
         } else {
-            shared.log(format!("[принтер] заправка → {}", cfg.printer.refill_command));
+            shared.log(format!(
+                "[принтер] заправка → {}",
+                cfg.printer.refill_command
+            ));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         printer_send_confirmed(
@@ -2501,13 +2865,14 @@ pub(crate) async fn printer_once(shared: &Shared, cfg: &Config) -> Result<(), Bo
             ));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-        printer_send_confirmed(
+        let reply = printer_send_confirmed(
             shared,
             &chat,
             cfg.printer.withdraw_command.trim(),
             cfg.printer.reply_timeout_secs,
         )
         .await?;
+        credit_reply(shared, reply.as_deref(), "[принтер]");
     }
 
     shared.set_last_printer(now_unix());
@@ -2580,7 +2945,45 @@ async fn printer_send_confirmed(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_bonus_reply, parse_bonus_delay, parse_printer_info, pet_prep_command, BonusReply, PrinterInfo};
+    #[test]
+    fn pet_return_message_recognised() {
+        let paid = "Nekiplay (http://t.me/nekiplay), ваш питомец вернулся из похода, зачислено 91.108.415$ 🎁";
+        assert!(super::pet_is_return(paid));
+        assert!(!super::pet_is_return(
+            "Питомец отправился в поход, вернётся через 1 час"
+        ));
+        assert!(!super::pet_is_return(
+            "Nekiplay, покормите своего питомца чтобы отправить его в поход"
+        ));
+        assert!(!super::pet_is_return("🎁 Бонус получен, зачислено 1000$"));
+    }
+
+    #[test]
+    fn credited_amount_is_parsed() {
+        assert_eq!(
+            super::credited_amount(
+                "Nekiplay, ваш питомец вернулся из похода, зачислено 193.806.639$ 🎁"
+            ),
+            Some(193_806_639.0)
+        );
+        assert_eq!(
+            super::credited_amount("Вы сняли с бизнеса 82.936.250.000$"),
+            Some(82_936_250_000.0)
+        );
+        assert_eq!(
+            super::credited_amount("Вы выиграли 5.000.000$"),
+            Some(5_000_000.0)
+        );
+        assert_eq!(
+            super::credited_amount("Кулдаун, попробуйте через 10 секунд"),
+            None
+        );
+    }
+
+    use super::{
+        classify_bonus_reply, parse_bonus_delay, parse_printer_info, pet_prep_command, BonusReply,
+        PrinterInfo,
+    };
 
     #[test]
     fn classifies_bonus_replies() {
@@ -2605,9 +3008,18 @@ mod tests {
     #[test]
     fn parses_bonus_delay() {
         assert_eq!(parse_bonus_delay("Nekiplay, бонус 26.000.000$ и 400 GB 🙂\n🔥 Стрик: 1/7\n⏳ Следующий бонус через 12ч."), Some(12 * 3600));
-        assert_eq!(parse_bonus_delay("Роман, до получения бонуса 6 мин. 29 сек. ⏳"), Some(389));
-        assert_eq!(parse_bonus_delay("Роман, до получения бонуса 10 мин. 9 сек. ⏳"), Some(609));
-        assert_eq!(parse_bonus_delay("Попробуйте через 3 часа 😉"), Some(3 * 3600));
+        assert_eq!(
+            parse_bonus_delay("Роман, до получения бонуса 6 мин. 29 сек. ⏳"),
+            Some(389)
+        );
+        assert_eq!(
+            parse_bonus_delay("Роман, до получения бонуса 10 мин. 9 сек. ⏳"),
+            Some(609)
+        );
+        assert_eq!(
+            parse_bonus_delay("Попробуйте через 3 часа 😉"),
+            Some(3 * 3600)
+        );
         assert_eq!(parse_bonus_delay("Приходите через 2 дня"), Some(2 * 86_400));
         assert_eq!(parse_bonus_delay("Роман, VIP бонус +200 GB 💵"), None);
         assert_eq!(parse_bonus_delay("Баланс: 2.046.868.646.673$"), None);
@@ -2767,9 +3179,8 @@ async fn race_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
                                 return Ok(());
                             }
                             RaceReply::Inspection(secs) => {
-                                let due = now_unix()
-                                    + secs as i64
-                                    + cfg.race.cooldown_margin_secs as i64;
+                                let due =
+                                    now_unix() + secs as i64 + cfg.race.cooldown_margin_secs as i64;
                                 shared.set_next_race(due);
                                 return Ok(());
                             }
@@ -2958,6 +3369,45 @@ fn reply_for_player(shared: &Shared, text: &str) -> bool {
     text.to_lowercase().contains(&name.to_lowercase())
 }
 
+/// Сумма прихода из ответа бота: «зачислено 193.806.639$», «сняли 1.000$»,
+/// «Вы выиграли 5.000.000$», «нашли в сейфе 17.902.076.393$».
+fn credited_amount(text: &str) -> Option<f64> {
+    const KEYS: [&str; 5] = [
+        "зачислено",
+        "сняли",
+        "выиграли",
+        "нашли в сейфе",
+        "получили",
+    ];
+    let lower = text.to_lowercase();
+    for key in KEYS {
+        let Some(at) = lower.find(key) else {
+            continue;
+        };
+        let rest = &text[at + key.len()..];
+        let digits: String = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',' || *c == ' ')
+            .collect();
+        if let Some(value) = crate::history::parse_money(Some(&digits)) {
+            if value > 0.0 {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Ответ на снятие: зачисляем сумму в график наличных.
+fn credit_reply(shared: &Shared, reply: Option<&str>, tag: &str) {
+    let Some(sum) = reply.and_then(credited_amount) else {
+        return;
+    };
+    shared.log(format!("{tag} снято {sum}$"));
+    shared.note_income(sum);
+}
+
 /// Достаём сумму из «вы сняли с бизнеса 82.936.250.000$».
 fn business_amount(text: &str) -> Option<String> {
     let line = text.lines().find(|l| l.contains("сняли с бизнеса"))?;
@@ -3034,7 +3484,12 @@ async fn business_once(shared: &Shared, cfg: &Config) -> Result<(), BoxError> {
     }
 
     match business_amount(&reply) {
-        Some(sum) => shared.log(format!("[бизнес] снято {sum}$")),
+        Some(sum) => {
+            shared.log(format!("[бизнес] снято {sum}$"));
+            if let Some(value) = crate::history::parse_money(Some(&sum)) {
+                shared.note_income(value);
+            }
+        }
         None => shared.log(format!("[бизнес] ответ: {}", one_line(&reply))),
     }
     shared.set_last_business(now_unix());

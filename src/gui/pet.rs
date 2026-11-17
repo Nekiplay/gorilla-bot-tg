@@ -1,90 +1,102 @@
-use std::time::Duration;
+//! Питомец: расписание «Питомец поход» и подготовка по просьбе бота.
 
-use eframe::egui::{self, *};
-
-use super::App;
-use super::common::*;
+use super::{common, theme, Bot};
 use crate::engine::Command;
+use gpui_kit::component::v_flex;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Context, ParentElement, Styled, Window};
+/// Страница «Питомец».
+pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let command = bot.field("pet.command", window, cx);
+    let feed = bot.field("pet.feed_command", window, cx);
+    let interval = bot.field("pet.interval_secs", window, cx);
+    let jitter = bot.field("pet.interval_jitter_secs", window, cx);
+    let timeout = bot.field("pet.reply_timeout_secs", window, cx);
 
-    pub(super) fn pet_card(app: &mut App, ui: &mut egui::Ui, left: Option<Duration>, last_pet: Option<i64>) {
-        card(ui, "Питомец", |ui| {
-            ui.checkbox(
-                &mut app.cfg.pet.enabled,
-                RichText::new("Авто «Питомец поход»").size(13.0).color(TEXT),
-            );
-            ui.checkbox(
-                &mut app.cfg.pet.feed_when_hungry,
-                RichText::new("Выполнять подготовку, которую просит бот (покормить/поиграть)")
-                    .size(13.0)
-                    .color(TEXT),
-            );
+    let last = bot.shared.last_pet();
+    let left = bot.shared.next_pet_in();
+    let interval_secs = bot.cfg.pet.interval_secs;
+    let jitter_secs = bot.cfg.pet.interval_jitter_secs;
+    let enabled = bot.cfg.pet.enabled;
+    let feed_when_hungry = bot.cfg.pet.feed_when_hungry;
 
-            row(ui, "Команда", |ui| {
-                wide_edit(ui, &mut app.cfg.pet.command, "Питомец поход");
-            });
-            row(ui, "Подготовка", |ui| {
-                wide_edit(ui, &mut app.cfg.pet.feed_command, "Питомец покормить");
-            });
-            hint(
-                ui,
-                "Команду подготовки бот называет сам в кавычках — она берётся из ответа.",
-            );
-            row(ui, "Интервал, с", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut app.cfg.pet.interval_secs)
-                        .speed(60.0)
-                        .range(60..=86_400),
-                );
-            });
-            row(ui, "Разброс, с", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut app.cfg.pet.interval_jitter_secs)
-                        .speed(10.0)
-                        .range(0..=3_600),
-                );
-            });
-            row(ui, "Ждать ответ, с", |ui| {
-                ui.add(egui::DragValue::new(&mut app.cfg.pet.reply_timeout_secs).range(5..=300));
-            });
+    let hours = interval_secs / 3600;
+    let minutes = interval_secs % 3600 / 60;
+    let spread = (jitter_secs / 60).max(1);
+    let hint = format!(
+        "{hours} ч {minutes} мин +0..{spread} мин ({interval_secs}–{} с)",
+        interval_secs + jitter_secs
+    );
 
-            let interval = app.cfg.pet.interval_secs;
-            let jitter = app.cfg.pet.interval_jitter_secs.min(interval);
-            hint(
-                ui,
-                &format!(
-                    "{} ч {} мин +0..{} мин ({}–{} с)",
-                    interval / 3600,
-                    interval % 3600 / 60,
-                    jitter / 60,
-                    interval,
-                    interval + jitter
+    let last_line = match last {
+        Some(ts) => format!(
+            "Последняя отправка: {} ({})",
+            common::local_hhmm(ts),
+            common::ago(Some(ts))
+        ),
+        None => "Ещё не отправлялся — уйдёт при старте.".to_string(),
+    };
+    let next_line = match left {
+        Some(left) => format!("Следующий поход через {}", common::fmt_dur(left)),
+        None => "Авто-поход выключен".to_string(),
+    };
+
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(common::card_with(
+            cx,
+            "Питомец",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(bot.flag("pet.enabled", "Авто «Питомец поход»", enabled, cx))
+                .child(bot.flag(
+                    "pet.feed_when_hungry",
+                    "Выполнять подготовку, которую просит бот (покормить/поиграть)",
+                    feed_when_hungry,
+                    cx,
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Команда",
+                    common::wide_input(&command),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Подготовка",
+                    common::wide_input(&feed),
+                ))
+                .child(common::hint(
+                    &*cx,
+                    "Команду подготовки бот называет сам в кавычках.",
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Интервал, с",
+                    common::wide_input(&interval),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Разброс, с",
+                    common::wide_input(&jitter),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Ждать ответ, с",
+                    common::wide_input(&timeout),
+                ))
+                .child(common::hint(&*cx, hint))
+                .child(common::hint(&*cx, last_line))
+                .child(common::hint(&*cx, next_line).text_color(if left.is_some() {
+                    theme::accent_light(&*cx)
+                } else {
+                    theme::muted(&*cx)
+                }))
+                .child(
+                    bot.primary_action("pet-now", "Отправить сейчас", || Command::PetNow, cx)
+                        .w_full(),
                 ),
-            );
-
-            ui.add_space(4.0);
-            match last_pet {
-                Some(ts) => hint(ui, &format!("Последняя отправка: {} ({})", local_hhmm(ts), ago(ts))),
-                None => hint(ui, "Ещё не отправлялся — уйдёт при старте."),
-            }
-            match left {
-                Some(d) => {
-                    ui.label(
-                        RichText::new(format!("Следующий поход через {}", fmt_dur(d)))
-                            .color(ACCENT_LIGHT),
-                    );
-                }
-                None => hint(ui, "Авто-поход выключен"),
-            }
-
-            ui.add_space(4.0);
-            if ui
-                .add(
-                    Button::new("Отправить сейчас")
-                        .min_size(Vec2::new(ui.available_width(), 26.0)),
-                )
-                .clicked()
-            {
-                let _ = app.tx.send(Command::PetNow);
-            }
-        });
-    }
+        ))
+        .into_any_element()
+}

@@ -1,96 +1,188 @@
+//! Обзор: таймеры автокоманд и состояние казино.
 
-use eframe::egui::{self, *};
+use super::{charts, common, theme, Bot};
+use crate::engine::BonusKind;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::{div, px, AnyElement, Context, ParentElement, Styled, Window};
 
-use super::App;
-use super::common::*;
-use crate::engine::{BonusKind, Status};
+/// Страница «Обзор».
+pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let cfg = bot.cfg.clone();
+    let shared = bot.shared.clone();
 
-/// Главная: круговые таймеры до следующей отправки по каждой команде.
-pub(super) fn overview(app: &mut App, ui: &mut egui::Ui, status: &Status) {
-        let rows = [
-            ("Питомец", app.cfg.pet.enabled, app.shared.next_pet_in(), app.cfg.pet.interval_secs, app.shared.last_pet(), OK),
-            ("Принтер", app.cfg.printer.enabled, app.shared.next_printer_in(), app.cfg.printer.interval_secs, app.shared.last_printer(), WARN),
-            ("Гонка", app.cfg.race.enabled, app.shared.next_race_in(), app.cfg.race.interval_secs, app.shared.last_race(), ACCENT_LIGHT),
-            ("Бизнес", app.cfg.business.enabled, app.shared.next_business_in(), app.cfg.business.interval_secs, app.shared.last_business(), OK),
-            ("Бонус", app.cfg.bonus.enabled, app.shared.next_bonus_in(BonusKind::Channel), app.cfg.bonus.interval_secs, app.shared.last_bonus(BonusKind::Channel), ACCENT),
-            ("Бонус в ЛС", app.cfg.bonus_dm.enabled, app.shared.next_bonus_in(BonusKind::Dm), app.cfg.bonus_dm.interval_secs, app.shared.last_bonus(BonusKind::Dm), TEXT_DIM),
-        ];
+    // Кольца таймеров: в строку, при нехватке места — следующими рядами.
+    let cols = common::columns(window, 168.);
+    let rows = common::rows(
+        vec![
+            common::timer_ring(
+                &*cx,
+                "Питомец",
+                cfg.pet.enabled,
+                shared.next_pet_in(),
+                cfg.pet.interval_secs,
+                shared.last_pet(),
+                theme::ok(&*cx),
+            ),
+            common::timer_ring(
+                &*cx,
+                "Принтер",
+                cfg.printer.enabled,
+                shared.next_printer_in(),
+                cfg.printer.interval_secs,
+                shared.last_printer(),
+                theme::warn(&*cx),
+            ),
+            common::timer_ring(
+                &*cx,
+                "Гонка",
+                cfg.race.enabled,
+                shared.next_race_in(),
+                cfg.race.interval_secs,
+                shared.last_race(),
+                theme::accent_light(&*cx),
+            ),
+            common::timer_ring(
+                &*cx,
+                "Бизнес",
+                cfg.business.enabled,
+                shared.next_business_in(),
+                cfg.business.interval_secs,
+                shared.last_business(),
+                theme::ok(&*cx),
+            ),
+            common::timer_ring(
+                &*cx,
+                "Бонус в канал",
+                cfg.bonus.enabled,
+                shared.next_bonus_in(BonusKind::Channel),
+                cfg.bonus.interval_secs,
+                shared.last_bonus(BonusKind::Channel),
+                theme::accent(&*cx),
+            ),
+            common::timer_ring(
+                &*cx,
+                "Бонус в личку",
+                cfg.bonus_dm.enabled,
+                shared.next_bonus_in(BonusKind::Dm),
+                cfg.bonus_dm.interval_secs,
+                shared.last_bonus(BonusKind::Dm),
+                theme::text_dim(&*cx),
+            ),
+        ],
+        cols,
+    );
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Обзор").size(24.0).strong().color(TEXT));
-            ui.add_space(6.0);
-            let (label, color) = if status.connected {
-                ("● онлайн", OK)
-            } else {
-                ("● офлайн", MUTED)
-            };
-            pill(ui, label, color);
-            if status.casino_running {
-                pill(ui, "казино идёт", WARN);
-            }
-        });
-        hint(ui, "Сколько осталось до отправки каждой команды. Настройки — во вкладках сверху.");
-        ui.add_space(10.0);
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(common::card_with(
+            cx,
+            "Обзор",
+            v_flex().w_full().gap_3().child(rows).child(common::hint(
+                &*cx,
+                "Сколько осталось до отправки каждой команды.",
+            )),
+        ))
+        .child(status_card(bot, cx))
+        .child(history_charts(bot, cx))
+        .into_any_element()
+}
 
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(18.0, 18.0);
-            for (title, enabled, left, total, last, color) in rows {
-                timer_ring(ui, title, enabled, left, total, last, color);
-            }
-        });
+/// Графики сейфов и капчи из истории.
+fn history_charts(bot: &Bot, cx: &mut Context<Bot>) -> AnyElement {
+    let history = bot.shared.history();
 
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(charts::safe_rate(&*cx, &history, theme::accent_light(&*cx)))
+        .child(charts::captcha_rate(&*cx, &history, theme::ok(&*cx)))
+        .child(common::hint(&*cx, history_note(&history)))
+        .into_any_element()
+}
+
+/// Карточка «Статус» с показателями казино.
+fn status_card(bot: &Bot, cx: &mut Context<Bot>) -> AnyElement {
+    let status = bot.shared.status();
+    let badge = if status.casino_running {
+        common::pill(&*cx, "казино идёт", theme::warn(&*cx))
+    } else {
+        common::pill(&*cx, "простой", theme::muted(&*cx))
+    };
+
+    let stats = common::rows(
+        vec![
+            common::stat(&*cx, "Раунды", status.rounds.to_string(), theme::text(&*cx)),
+            common::stat(&*cx, "Победы", status.wins.to_string(), theme::ok(&*cx)),
+            common::stat(
+                &*cx,
+                "Проигрыши подряд",
+                status.losses_in_row.to_string(),
+                if status.losses_in_row > 0 {
+                    theme::warn(&*cx)
+                } else {
+                    theme::text(&*cx)
+                },
+            ),
+            common::stat(
+                &*cx,
+                "Ставка",
+                status.bet.to_string(),
+                theme::accent_light(&*cx),
+            ),
+        ],
+        4,
+    );
+
+    let mut card = v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(common::card_title(&*cx, "Статус"))
+                .child(badge),
+        )
+        .child(stats);
+
+    if !status.message.is_empty() {
+        card = card.child(common::hint(&*cx, status.message));
+    }
+    if !status.last_bot_reply.is_empty() {
+        card = card.child(
+            div()
+                .w_full()
+                .p_2()
+                .rounded(px(6.))
+                .bg(theme::field(&*cx))
+                .child(common::hint(
+                    &*cx,
+                    format!("бот: {}", status.last_bot_reply),
+                )),
+        );
     }
 
-    pub(super) fn status_card(_app: &mut App, ui: &mut egui::Ui, status: &Status) {
-        Frame::new()
-            .fill(CARD)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(6)
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Статус").strong().size(14.5).color(TEXT));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (text, color) = if status.casino_running {
-                            ("казино идёт", WARN)
-                        } else {
-                            ("простой", MUTED)
-                        };
-                        ui.label(RichText::new(text).size(12.0).color(color));
-                    });
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    stat(ui, "Раунды", &status.rounds.to_string(), TEXT);
-                    stat(ui, "Победы", &status.wins.to_string(), OK);
-                    stat(
-                        ui,
-                        "Проигрыши подряд",
-                        &status.losses_in_row.to_string(),
-                        if status.losses_in_row > 0 { WARN } else { TEXT },
-                    );
-                    stat(ui, "Ставка", &status.bet.to_string(), ACCENT_LIGHT);
-                });
-
-                if !status.message.is_empty() {
-                    ui.add_space(7.0);
-                    ui.label(RichText::new(&status.message).size(13.0).color(MUTED));
-                }
-                if !status.last_bot_reply.is_empty() {
-                    ui.add_space(7.0);
-                    Frame::new()
-                        .fill(FIELD)
-                        .corner_radius(4)
-                        .inner_margin(Margin::symmetric(10, 7))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(format!("бот: {}", status.last_bot_reply))
-                                    .size(12.5)
-                                    .color(TEXT_DIM),
-                            );
-                        });
-                }
-            });
+    card.into_any_element()
+}
+/// Сводка по истории: сколько замеров и с какого времени.
+fn history_note(history: &crate::history::History) -> String {
+    if history.is_empty() {
+        return "история ещё пуста: первый замер появится через минуту".to_string();
     }
+    let Some(first) = history.first() else {
+        return String::new();
+    };
+    let (rounds, wins, safes, captcha) = history.progress();
+    format!(
+        "замеров: {} (с {}), за это время: раундов +{}, побед +{}, сейфов {}, капч {}",
+        history.len(),
+        common::local_hhmm(first.ts),
+        rounds,
+        wins,
+        safes,
+        captcha,
+    )
+}

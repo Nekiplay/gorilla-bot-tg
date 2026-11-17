@@ -1,58 +1,71 @@
+//! Журнал событий движка.
 
-use eframe::egui::{self, *};
+use super::{common, theme, Bot};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::{div, px, AnyElement, Context, ParentElement, Styled};
 
-use super::App;
-use super::common::*;
+/// Сколько строк журнала показываем.
+const VISIBLE: usize = 400;
 
-    pub(super) fn log_card(app: &mut App, ui: &mut egui::Ui) {
-        let logs = app.shared.logs();
-        let height = ui.available_height().max(140.0);
-        Frame::new()
-            .fill(CARD)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(6)
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.set_height(height);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Журнал").strong().size(14.5).color(TEXT));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("{} строк", logs.len()))
-                                .size(11.5)
-                                .color(MUTED),
-                        );
-                    });
-                });
+/// Тело журнала — используется и в правой панели.
+pub(super) fn page_body(
+    shared: &std::sync::Arc<crate::engine::Shared>,
+    cx: &mut Context<Bot>,
+) -> AnyElement {
+    let logs = shared.logs();
+    let total = logs.len();
+    let start = total.saturating_sub(VISIBLE);
 
-                ui.add_space(5.0);
-                let body = (height - 58.0).max(80.0);
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .max_height(body)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let start = logs.len().saturating_sub(400);
-                        for line in &logs[start..] {
-                            let color = if line.contains("ошибка") || line.contains("не удалось")
-                            {
-                                DANGER
-                            } else if line.contains("выигрыш") || line.contains("выиграли") {
-                                OK
-                            } else if line.contains("проигрыш") {
-                                WARN
-                            } else {
-                                TEXT_DIM
-                            };
-                            ui.add(
-                                Label::new(
-                                    RichText::new(line).monospace().size(12.0).color(color),
-                                )
-                                .selectable(true),
-                            );
-                        }
-                    });
-            });
+    let mut column = v_flex().w_full().gap_0p5();
+    for line in &logs[start..] {
+        column = column.child(
+            Label::new(line.clone())
+                .text_size(px(12.))
+                .text_color(line_color(&*cx, line)),
+        );
     }
+
+    v_flex()
+        .w_full()
+        .h_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(common::card_title(&*cx, "Журнал"))
+                .child(
+                    Label::new(format!("{total} строк"))
+                        .text_size(px(12.))
+                        .text_color(theme::muted(&*cx)),
+                ),
+        )
+        .child(
+            div()
+                .id("log-scroll")
+                .flex_1()
+                .min_h(px(140.))
+                .w_full()
+                .overflow_y_scrollbar()
+                .child(column),
+        )
+        .into_any_element()
+}
+
+/// Цвет строки по ключевым словам.
+fn line_color(cx: &gpui_kit::App, line: &str) -> gpui_kit::Hsla {
+    let lower = line.to_lowercase();
+    if lower.contains("ошибка") || lower.contains("не удалось") {
+        theme::danger(cx)
+    } else if lower.contains("выигрыш") || lower.contains("выиграли") {
+        theme::ok(cx)
+    } else if lower.contains("проигрыш") {
+        theme::warn(cx)
+    } else {
+        theme::text_dim(cx)
+    }
+}

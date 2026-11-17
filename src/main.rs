@@ -11,11 +11,14 @@
 //! * `balance` — спросить у бота баланс и показать ответ;
 //! * `casino`  — автоигра в казино с удвоением ставки после проигрыша.
 
+mod balancer;
+
 mod captcha;
 mod casino;
 mod config;
 mod engine;
 mod gui;
+mod history;
 mod mtproxy;
 mod profile;
 mod race;
@@ -28,18 +31,20 @@ use std::time::Duration;
 
 use casino::{Martingale, Outcome};
 use config::{CasinoConfig, Config, WsTunnel};
-use grammers_client::message::Message;
 use grammers_client::client::UpdateStream;
+use grammers_client::message::Message;
 use grammers_client::peer::Peer;
-use grammers_client::sender::{ConnectionParams, SenderPool, SenderPoolFatHandle, UpdatesConfiguration};
-use grammers_client::tl;
-use grammers_mtproto::transport::Intermediate;
-use grammers_mtsender::ServerAddr;
+use grammers_client::sender::{
+    ConnectionParams, SenderPool, SenderPoolFatHandle, UpdatesConfiguration,
+};
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
+use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::Client;
+use grammers_mtproto::transport::Intermediate;
+use grammers_mtsender::ServerAddr;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -97,6 +102,22 @@ fn main() {
     rt.block_on(run_cli(mode));
 }
 
+/// Диагностический вход: запросить код и напечатать, куда Telegram его шлёт.
+async fn login_mode(cfg: &Config) -> Result<(), BoxError> {
+    let phone = std::env::args().nth(2).unwrap_or_else(|| cfg.phone.clone());
+    if phone.trim().is_empty() {
+        return Err(
+            "первый аргумент команды: номер телефона (или заполни phone в config.json)".into(),
+        );
+    }
+    let shared = engine::Shared::new(cfg.clone());
+    engine::login_request(&shared, phone.clone()).await;
+    for line in shared.logs().iter().rev().take(6).rev() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 async fn run_cli(mode: String) {
     let cfg = match Config::load() {
         Ok(cfg) => cfg,
@@ -117,6 +138,7 @@ async fn run_cli(mode: String) {
         "race" => race_mode(&cfg).await,
         "check" => check(&cfg).await,
         "probe" => probe_mode(&cfg).await,
+        "login" => login_mode(&cfg).await,
         other => {
             eprintln!("Неизвестный режим «{other}».");
             print_usage();
@@ -145,52 +167,226 @@ fn print_usage() {
     );
 }
 
-/// Маршрут подключения: свой воркер → стандартные CF-прокси tg-ws-proxy →
-/// MTProto-прокси → внешний SOCKS5 → прямое (`None`). Поднимает мост
-/// (локальный SOCKS5) и возвращает его адрес для grammers.
-async fn local_proxy_url(cfg: &Config) -> Result<Option<String>, BoxError> {
-    match cfg.mtproxy.ws_tunnel() {
-        Some(WsTunnel::Worker(worker)) => {
-            // Cloudflare-worker: WSS-труба прямо к DC, DPI её не видит.
-            let local = mtproxy::spawn_worker_bridge(worker).await?;
-            Ok(Some(format!("socks5://{local}")))
+/// Последний выбранный маршрут — чтобы движок написал его в лог окна.
+static ROUTE_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Что показать в логе про канал связи (после первого `connect`).
+pub(crate) fn route_note() -> &'static str {
+    ROUTE_NOTE
+        .get()
+        .map(String::as_str)
+        .unwrap_or("маршрут ещё не выбран")
+}
+
+/// Готовый маршрут до Telegram: адрес прокси для grammers (None — прямое),
+/// человеческое описание для лога/`--check` и нужна ли intermediate-кадровка.
+struct Route {
+    proxy: Option<String>,
+    note: String,
+    intermediate: bool,
+}
+
+impl Route {
+    /// Локальный мост внутри процесса: SOCKS5 на 127.0.0.1 с intermediate-кадровкой.
+    fn bridge(local: std::net::SocketAddr, note: String) -> Self {
+        Self {
+            proxy: Some(format!("socks5://{local}")),
+            note,
+            intermediate: true,
         }
-        Some(WsTunnel::Defaults) => {
-            // Свой воркер не задан — стандартные CF-прокси из tg-ws-proxy.
-            let local = mtproxy::spawn_cfproxy_bridge().await?;
-            Ok(Some(format!("socks5://{local}")))
+    }
+}
+
+/// Маршрут подключения: свой воркер → MTProto-прокси по секрету →
+/// живой локальный прокси на `mtproxy.host:port` → внешний SOCKS5 → прямое.
+/// Стандартные CF-прокси (`kws*`, они часто лежат) берём только если
+/// локальный прокси задан, но не отвечает, — и говорим об этом вслух.
+async fn resolve_route(cfg: &Config) -> Result<Route, BoxError> {
+    let mt = &cfg.mtproxy;
+    mtproxy::configure(mt);
+    let host = mt.host.trim();
+
+    if let Some(WsTunnel::Worker(worker)) = mt.ws_tunnel() {
+        // Cloudflare-worker: WSS-труба прямо к DC, DPI её не видит.
+        let local = mtproxy::spawn_worker_bridge(worker.clone()).await?;
+        return Ok(finish(Route::bridge(
+            local,
+            format!("свой Cloudflare-worker «{worker}»"),
+        )));
+    }
+
+    if !mt.secret.trim().is_empty() {
+        // Встроенный мост: локальный SOCKS5 → настоящий MTProto-прокси.
+        let secret = mtproxy::parse_secret(&mt.secret)?;
+        let target = std::net::SocketAddr::new(
+            host.parse()
+                .map_err(|e| format!("mtproxy.host «{}»: {e}", mt.host))?,
+            mt.port,
+        );
+        let local = mtproxy::spawn_socks_bridge(target, secret).await?;
+        return Ok(finish(Route::bridge(
+            local,
+            format!("локальный MTProto-прокси {host}:{} (секрет задан)", mt.port),
+        )));
+    }
+
+    // Секрета нет: смотрим, что реально слушает host:port.
+    let kind = if host.is_empty() || mt.port == 0 {
+        mtproxy::LocalKind::Closed
+    } else {
+        mtproxy::probe_local(host, mt.port).await
+    };
+    let mut open_needs_secret = false;
+    match kind {
+        mtproxy::LocalKind::Socks5 => {
+            return Ok(finish(Route {
+                proxy: Some(format!("socks5://{host}:{}", mt.port)),
+                note: kind.describe(host, mt.port),
+                intermediate: false,
+            }));
         }
-        None if !cfg.mtproxy.secret.trim().is_empty() => {
-            // Встроенный мост: локальный SOCKS5 → настоящий MTProto-прокси.
-            let secret = mtproxy::parse_secret(&cfg.mtproxy.secret)?;
+        mtproxy::LocalKind::Open => open_needs_secret = true,
+        mtproxy::LocalKind::Closed => {}
+    }
+
+    // Стандартный пул tg-ws-proxy (`kws<dc>.<домен>`): основной путь, когда
+    // свой воркер не задан. Проверяем, отвечает ли он из этой сети — иначе
+    // молчаливые таймауты, как раньше с `kws2.*`.
+    if !mt.cf_domains.is_empty() {
+        let joined = mt.cf_domains.join(
+            "
+",
+        );
+        let accepted = mtproxy::set_cf_domains(mtproxy::parse_cf_domains(&joined));
+        if accepted > 0 {
+            println!("[cf-прокси] свой список доменов пула: {accepted}");
+        } else {
+            eprintln!("[cf-прокси] список mtproxy.cf_domains не принят, беру стандартный");
+        }
+    }
+    // Список доменов апстрим держит в репозитории и обновляет — берём свежий.
+    match mtproxy::refresh_cf_domains().await {
+        Ok(count) => println!("[cf-прокси] список доменов обновлён из репозитория: {count}"),
+        Err(e) => eprintln!("[cf-прокси] свежий список не получен ({e}), беру зашитый"),
+    }
+
+    // Домены, которых больше нет в списке, убираем и из счёта.
+    if let Ok(mut scores) = crate::balancer::global().lock() {
+        scores.retain_domains(&mtproxy::cf_domains());
+    }
+
+    let probe = mtproxy::cf_pool_probe().await;
+    if let Some(live) = probe.live.clone() {
+        let local = mtproxy::spawn_cfproxy_bridge().await?;
+        return Ok(finish(Route::bridge(
+            local,
+            format!("стандартный пул tg-ws-proxy (kws*.*), ответил {live}"),
+        )));
+    }
+    let pool_reason = if probe.reasons.is_empty() {
+        "стандартный пул tg-ws-proxy не ответил".to_string()
+    } else {
+        format!(
+            "стандартный пул tg-ws-proxy не ответил: {}",
+            probe.reasons.join("; ")
+        )
+    };
+
+    // Пул молчит (обычно провайдер режет TLS по SNI этих доменов).
+    // Тогда — свой воркер из настроек TgWsProxy, но говорим, если он выключен.
+    if let Some((worker, enabled)) = mtproxy::tgws_worker_domain() {
+        let local = mtproxy::spawn_worker_bridge(worker.clone()).await?;
+        let flag = if enabled {
+            "воркер включён в TgWsProxy"
+        } else {
+            "воркер ВЫКЛЮЧЕН в TgWsProxy, беру его как последний вариант"
+        };
+        return Ok(finish(Route::bridge(
+            local,
+            format!("{pool_reason}; {flag}: «{worker}»"),
+        )));
+    }
+
+    // Локальный TgWsProxy: его секрет и порт берём из его же config.json,
+    // чтобы пустой mtproxy.secret в config.json бота не блокировал подключение.
+    if kind != mtproxy::LocalKind::Socks5 {
+        if let Some((tgws_host, tgws_port, secret)) = mtproxy::tgws_local() {
             let target = std::net::SocketAddr::new(
-                cfg.mtproxy
-                    .host
-                    .trim()
+                tgws_host
                     .parse()
-                    .map_err(|e| format!("mtproxy.host «{}»: {e}", cfg.mtproxy.host))?,
-                cfg.mtproxy.port,
+                    .map_err(|e| format!("адрес TgWsProxy «{tgws_host}»: {e}"))?,
+                tgws_port,
             );
             let local = mtproxy::spawn_socks_bridge(target, secret).await?;
-            Ok(Some(format!("socks5://{local}")))
+            return Ok(finish(Route::bridge(
+                local,
+                format!(
+                    "локальный TgWsProxy {tgws_host}:{tgws_port} (секрет взят из его config.json)"
+                ),
+            )));
         }
-        None => Ok(cfg.proxy.clone().filter(|p| !p.trim().is_empty())),
     }
+
+    if open_needs_secret {
+        return Err(format!(
+            "{}; впиши секрет прокси в mtproxy.secret (или выключи прокси: mtproxy.worker = \"off\")",
+            kind.describe(host, mt.port)
+        )
+        .into());
+    }
+
+    // Воркер выключен явно (`off`/`none`/`-`): CF-прокси не навязываем.
+    if !mt.worker.trim().is_empty() {
+        let proxy = cfg.proxy.clone().filter(|p| !p.trim().is_empty());
+        let note = if proxy.is_some() {
+            format!(
+                "{}; беру socks-прокси из config.json",
+                kind.describe(host, mt.port)
+            )
+        } else {
+            format!("{}; иду напрямую", kind.describe(host, mt.port))
+        };
+        return Ok(finish(Route {
+            proxy,
+            note,
+            intermediate: false,
+        }));
+    }
+
+    // Ни локального прокси, ни живого пула, ни воркера — честно говорим.
+    Err(format!(
+        "{}; стандартный пул tg-ws-proxy (kws*.*) не отвечает (провайдер режет TLS по SNI), своего воркера нет: запусти локальный прокси на {host}:{} и впиши его mtproxy.secret, либо укажи mtproxy.worker = \"<свой>.workers.dev\"",
+        kind.describe(host, mt.port),
+        mt.port
+    )
+    .into())
+}
+
+/// Запомнить выбранный маршрут для лога и вернуть его же.
+fn finish(route: Route) -> Route {
+    let _ = ROUTE_NOTE.set(route.note.clone());
+    route
 }
 
 /// Транспорт intermediate (0xee) нужен для любого моста: WSS-туннель или
 /// obfuscated2-прокси из конфига.
-fn intermediates(cfg: &Config) -> bool {
-    cfg.mtproxy.ws_tunnel().is_some() || !cfg.mtproxy.secret.trim().is_empty()
+fn intermediates(route: &Route) -> bool {
+    route.intermediate
 }
-
 
 /// Подключение: открывает сессию, поднимает пул, проверяет авторизацию.
 pub(crate) async fn connect(
     cfg: &Config,
     allow_unauthorized: bool,
-) -> Result<(Client, mpsc::Receiver<UpdatesLike>, SenderPoolFatHandle, JoinHandle<()>), BoxError>
-{
+) -> Result<
+    (
+        Client,
+        mpsc::Receiver<UpdatesLike>,
+        SenderPoolFatHandle,
+        JoinHandle<()>,
+    ),
+    BoxError,
+> {
     let session_path = session_path(&cfg.session_file);
     let session = Arc::new(
         SqliteSession::open(&session_path)
@@ -198,10 +394,11 @@ pub(crate) async fn connect(
             .map_err(|e| format!("не удалось открыть {}: {e}", session_path.display()))?,
     );
 
-    let proxy_url = local_proxy_url(cfg).await?;
+    let route = resolve_route(cfg).await?;
+    let proxy_url = route.proxy.clone();
     let params = ConnectionParams {
         proxy_url,
-        transport: if intermediates(cfg) {
+        transport: if intermediates(&route) {
             // Мост рассчитан на intermediate-кадровку (0xee).
             Box::new(|| Box::new(Intermediate::new()))
         } else {
@@ -253,8 +450,51 @@ async fn probe_mode(cfg: &Config) -> Result<(), BoxError> {
 /// Проверка канала связи: поднимает мост/прокси из конфига и делает
 /// настоящий MTProto-обмен (генерация ключа авторизации) с DC2 —
 /// без входа и без отправки кода на телефон.
+/// Таблица балансировщика: DC → домен и задержка рукопожатия (счёт).
+fn print_balancer_table() {
+    let ttl = std::time::Duration::from_secs(mtproxy::score_ttl_secs());
+    let rows = match crate::balancer::global().lock() {
+        Ok(scores) => scores.rows(crate::balancer::now(), ttl),
+        Err(_) => Vec::new(),
+    };
+    println!("Балансировщик (DC → домен, счёт в секундах):");
+    for dc in [2i16, 4] {
+        let mut line = 0;
+        for (row_dc, domain, score, ok) in &rows {
+            if *row_dc != dc {
+                continue;
+            }
+            let mark = if *ok { "" } else { "  (отказ)" };
+            println!("  DC{dc:<3} {domain:<28} {score:>7.2}{mark}");
+            line += 1;
+        }
+        if line == 0 {
+            println!("  DC{dc:<3} — замеров нет после прогрева, домен выберется первым забегом");
+        }
+    }
+    for (dc, domain, score, ok) in &rows {
+        if *dc != 2 && *dc != 4 {
+            let mark = if *ok { "" } else { "  (отказ)" };
+            println!("  DC{dc:<3} {domain:<28} {score:>7.2}{mark}");
+        }
+    }
+}
+
+
 async fn check(cfg: &Config) -> Result<(), BoxError> {
-    let proxy_url = local_proxy_url(cfg).await?.unwrap_or_default();
+    let route = resolve_route(cfg).await?;
+    println!("Маршрут: {}", route.note);
+    // Счёт заполняется живыми рукопожатиями, поэтому перед таблицей делаем
+    // по одному забегу на DC — иначе она всегда пустая.
+    if !mtproxy::cf_domains().is_empty() {
+        println!("Прогрев балансировщика: замеряю домены…");
+        mtproxy::score_pool(&[2, 4]).await;
+    }
+    print_balancer_table();
+    if route.proxy.is_none() {
+        println!("Прямое подключение (прокси не настроен).");
+    }
+    let proxy_url = route.proxy.clone().unwrap_or_default();
     if proxy_url.is_empty() {
         println!("Прямое подключение (прокси не настроен).");
     }
@@ -276,7 +516,7 @@ async fn check(cfg: &Config) -> Result<(), BoxError> {
 
     // Живой сокет — лотерея (мост сам делает редайалы до первого кадра,
     // но обрывы возможны и середине DH), поэтому несколько попыток.
-    let use_intermediate = intermediates(cfg);
+    let use_intermediate = intermediates(&route);
     let mut last_err = String::new();
     let mut ok = false;
     for attempt in 1..=3u32 {
@@ -308,12 +548,18 @@ async fn check(cfg: &Config) -> Result<(), BoxError> {
         Ok(())
     } else {
         eprintln!("❌ Канал не работает: {last_err}");
+        if let Some(reason) = mtproxy::last_reason() {
+            eprintln!("Причина: {reason}");
+        }
         Err("проверка канала не прошла".into())
     }
 }
 
 /// Находит бота по username и возвращает его (Peer, PeerRef).
-pub(crate) async fn resolve_bot(client: &Client, username: &str) -> Result<(Peer, PeerRef), BoxError> {
+pub(crate) async fn resolve_bot(
+    client: &Client,
+    username: &str,
+) -> Result<(Peer, PeerRef), BoxError> {
     let username = username.trim().trim_start_matches('@');
     let peer = client
         .resolve_username(username)
@@ -381,7 +627,9 @@ async fn bonus_mode(cfg: &Config) -> Result<(), BoxError> {
         "Чат «{}» найден (id {}), отправляю «{}»...",
         cfg.bonus.target, peer.id, cfg.bonus.command
     );
-    let sent = client.send_message(peer, cfg.bonus.command.as_str()).await?;
+    let sent = client
+        .send_message(peer, cfg.bonus.command.as_str())
+        .await?;
     println!("Отправлено (id {}).", sent.id());
 
     // Бот отвечает сроком до следующего бонуса — его и запланируем.
@@ -489,14 +737,7 @@ async fn pet_mode(cfg: &Config) -> Result<(), BoxError> {
     if let Some(prep) = prep {
         if cfg.pet.feed_when_hungry {
             println!("Питомец просит подготовку, отправляю: «{prep}»");
-            pet_cmd(
-                &client,
-                bot_ref,
-                bot_id,
-                &prep,
-                cfg.pet.reply_timeout_secs,
-            )
-            .await?;
+            pet_cmd(&client, bot_ref, bot_id, &prep, cfg.pet.reply_timeout_secs).await?;
             pet_cmd(
                 &client,
                 bot_ref,
@@ -547,16 +788,12 @@ async fn race_mode(cfg: &Config) -> Result<(), BoxError> {
         match race::parse_reply(&reply) {
             race::RaceReply::Inspection(secs) => {
                 let pause = secs + cfg.race.cooldown_margin_secs;
-                println!(
-                    "Техосмотр: ждём {} мин {} сек.",
-                    pause / 60,
-                    pause % 60
-                );
+                println!("Техосмотр: ждём {} мин {} сек.", pause / 60, pause % 60);
                 tokio::time::sleep(Duration::from_secs(pause)).await;
             }
             race::RaceReply::Started => {
-                let deadline = tokio::time::Instant::now()
-                    + Duration::from_secs(cfg.race.result_timeout_secs);
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_secs(cfg.race.result_timeout_secs);
                 let mut none: Option<UpdateStream> = None;
                 let waited = wait_reply(
                     &client, &mut none, bot_ref, bot_id, after_id, deadline, &NO_CANCEL, false,
@@ -580,7 +817,14 @@ async fn race_mode(cfg: &Config) -> Result<(), BoxError> {
             race::RaceReply::Unknown => break,
         }
     }
-    println!("Итог: {}", if win { "победа" } else { "без победы" });
+    println!(
+        "Итог: {}",
+        if win {
+            "победа"
+        } else {
+            "без победы"
+        }
+    );
 
     handle.quit();
     let _ = pool_task.await;
@@ -664,8 +908,17 @@ async fn pet_cmd(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut none: Option<UpdateStream> = None;
-    match wait_reply(client, &mut none, bot_ref, bot_id, sent.id(), deadline, &NO_CANCEL, false)
-        .await?
+    match wait_reply(
+        client,
+        &mut none,
+        bot_ref,
+        bot_id,
+        sent.id(),
+        deadline,
+        &NO_CANCEL,
+        false,
+    )
+    .await?
     {
         Wait::Reply(_, text) => {
             println!("Ответ бота:\n{text}");
@@ -690,8 +943,7 @@ async fn balance(cfg: &Config) -> Result<(), BoxError> {
         .await?;
     println!("Отправлено: «{}»", cfg.casino.balance_command);
 
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(cfg.casino.reply_timeout_secs);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.casino.reply_timeout_secs);
     let mut no_stream: Option<UpdateStream> = None;
     match wait_reply(
         &client,
@@ -876,14 +1128,7 @@ async fn casino_loop(
         println!("[восстановление] проверяю, чем закончилась ставка до обрыва…");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         match wait_reply(
-            client,
-            stream,
-            bot_ref,
-            bot_id,
-            p.sent_id,
-            deadline,
-            &NO_CANCEL,
-            true,
+            client, stream, bot_ref, bot_id, p.sent_id, deadline, &NO_CANCEL, true,
         )
         .await
         {
@@ -921,14 +1166,7 @@ async fn casino_loop(
 
         let deadline = tokio::time::Instant::now() + reply_timeout;
         match wait_reply(
-            client,
-            stream,
-            bot_ref,
-            bot_id,
-            sent_id,
-            deadline,
-            &NO_CANCEL,
-            true,
+            client, stream, bot_ref, bot_id, sent_id, deadline, &NO_CANCEL, true,
         )
         .await
         {
@@ -943,7 +1181,10 @@ async fn casino_loop(
             Ok(Wait::Cancelled) => return Ok(Flow::Done),
             Ok(Wait::Timeout) => {
                 *pending = None;
-                println!("Бот не ответил за {} с — останавливаюсь.", cfg.reply_timeout_secs);
+                println!(
+                    "Бот не ответил за {} с — останавливаюсь.",
+                    cfg.reply_timeout_secs
+                );
                 append_log("[timeout] бот не ответил")?;
                 return Ok(Flow::Done);
             }
@@ -1160,7 +1401,6 @@ pub(crate) async fn click_button(
     client.invoke(&request).await?;
     Ok(())
 }
-
 
 /// Первая непустая строка ответа бота — для консоли (полный текст уходит в лог).
 pub(crate) fn one_line(text: &str) -> String {

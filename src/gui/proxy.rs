@@ -1,45 +1,60 @@
+//! Прокси: SOCKS5, Cloudflare-воркер и локальный MTProxy.
 
-use eframe::egui::{self, *};
+use super::{common, Bot};
+use gpui_kit::component::v_flex;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Context, ParentElement, Styled, Window};
 
-use super::App;
-use super::common::*;
+/// Страница «Прокси».
+pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let socks5 = bot.field("proxy", window, cx);
+    let worker = bot.field("mtproxy.worker", window, cx);
+    let host = bot.field("mtproxy.host", window, cx);
+    let port = bot.field("mtproxy.port", window, cx);
+    let secret = bot.field("mtproxy.secret", window, cx);
 
-    pub(super) fn proxy_card(app: &mut App, ui: &mut egui::Ui) {
-        card(ui, "Прокси", |ui| {
-            row(ui, "SOCKS5", |ui| {
-                let mut proxy = app.cfg.proxy.clone().unwrap_or_default();
-                let w = ui.available_width();
-                if ui
-                    .add(
-                        TextEdit::singleline(&mut proxy)
-                            .hint_text("socks5://user:pass@host:port")
-                            .desired_width(w.max(80.0)),
-                    )
-                    .changed()
-                {
-                    app.cfg.proxy = if proxy.trim().is_empty() {
-                        None
-                    } else {
-                        Some(proxy.trim().to_string())
-                    };
-                }
-            });
-            row(ui, "Worker", |ui| {
-                wide_edit(ui, &mut app.cfg.mtproxy.worker, "name.workers.dev");
-            });
-            row(ui, "MTProxy host", |ui| {
-                wide_edit(ui, &mut app.cfg.mtproxy.host, "127.0.0.1");
-            });
-            row(ui, "MTProxy port", |ui| {
-                ui.add(egui::DragValue::new(&mut app.cfg.mtproxy.port).speed(1.0));
-            });
-            row(ui, "MTProxy secret", |ui| {
-                wide_edit(ui, &mut app.cfg.mtproxy.secret, "hex-секрет");
-            });
-            hint(
-                ui,
-                "Пусто — стандартные CF-прокси tg-ws-proxy (пул прогретых туннелей); свой \
-                 worker — WSS-труба; secret — MTProto-прокси; `off` — прямое подключение.",
-            );
-        });
-    }
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(common::card_with(
+            cx,
+            "Прокси",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(common::field_row(
+                    &*cx,
+                    "SOCKS5",
+                    common::wide_input(&socks5),
+                ))
+                .child(common::hint(
+                    &*cx,
+                    "Пустое поле — без прокси. Формат: socks5://user:pass@host:port",
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Worker",
+                    common::wide_input(&worker),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "MTProxy host",
+                    common::wide_input(&host),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "MTProxy port",
+                    common::wide_input(&port),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "MTProxy secret",
+                    common::wide_input(&secret),
+                ))
+                .child(common::hint(
+                    &*cx,
+                    "Воркер Cloudflare поднимает MTProxy рядом с ботом. Секрет — из вывода воркера.",
+                )),
+        ))
+        .into_any_element()
+}

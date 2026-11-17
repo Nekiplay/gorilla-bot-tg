@@ -1,126 +1,203 @@
-use eframe::egui::{self, Button, Color32, RichText};
+//! Telegram: вход по коду из Telegram и настройки подключения.
 
-use super::common::*;
-use super::App;
+use super::{common, theme, Bot};
 use crate::engine::{Command, LoginStage};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, ClickEvent, Context, ParentElement, Styled, Window};
 
-pub(super) fn telegram_card(app: &mut App, ui: &mut egui::Ui) {
-    account_card(app, ui);
-    settings_card(app, ui);
+/// Страница «Telegram».
+pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let api_id = bot.field("api_id", window, cx);
+    let api_hash = bot.field("api_hash", window, cx);
+    let phone = bot.field("phone", window, cx);
+    let bot_username = bot.field("bot_username", window, cx);
+    let session_file = bot.field("session_file", window, cx);
+    let player_name = bot.field("player_name", window, cx);
+
+    let account = account_card(bot, window, cx);
+
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(common::card_with(cx, "Аккаунт", account))
+        .child(common::card_with(
+            cx,
+            "Telegram",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(common::field_row(
+                    &*cx,
+                    "API ID",
+                    common::wide_input(&api_id),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "API hash",
+                    common::wide_input(&api_hash),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Телефон",
+                    common::wide_input(&phone),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Бот",
+                    common::wide_input(&bot_username),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Ник игрока",
+                    common::wide_input(&player_name),
+                ))
+                .child(common::hint(
+                    &*cx,
+                    "По нику проверяем, что ответ бота адресован вам, а не другому игроку.",
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Файл сессии",
+                    common::wide_input(&session_file),
+                ))
+                .child(common::hint(&*cx, "Лежит в папке tdata рядом с exe.")),
+        ))
+        .into_any_element()
 }
 
-/// Вход в Telegram: код и пароль 2FA вводятся здесь, а не в консоли.
-fn account_card(app: &mut App, ui: &mut egui::Ui) {
-    let stage = app.shared.login_stage();
-    let authorized = app.shared.status().authorized || matches!(stage, LoginStage::Done(_));
+/// Блок состояния входа.
+fn account_card(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let stage = bot.shared.login_stage();
+    match stage {
+        LoginStage::Idle | LoginStage::Failed(_) => {
+            let phone = bot.field("phone", window, cx);
+            let start = login_button(cx);
 
-    card(ui, "Вход в Telegram", |ui| {
-        if authorized && matches!(stage, LoginStage::Idle) {
-            pill(ui, "● сессия активна", OK);
-            hint(ui, "Вход уже выполнен. Сессия лежит в папке tdata рядом с exe.");
-            return;
+            let mut column = v_flex()
+                .w_full()
+                .gap_2()
+                .child(common::hint(&*cx, "Код придёт в Telegram (или SMS)."));
+            if let LoginStage::Failed(reason) = &stage {
+                column =
+                    column.child(common::hint(&*cx, reason.clone()).text_color(theme::warn(&*cx)));
+            }
+            column
+                .child(common::field_row(
+                    &*cx,
+                    "Телефон",
+                    common::wide_input(&phone),
+                ))
+                .child(h_flex().w_full().child(start))
+                .into_any_element()
         }
-
-        match &stage {
-            LoginStage::Idle | LoginStage::Failed(_) => {
-                row(ui, "Телефон", |ui| {
-                    wide_edit(ui, &mut app.cfg.phone, "+79991234567");
-                });
-                if let LoginStage::Failed(text) = &stage {
-                    ui.label(RichText::new(text).size(12.0).color(WARN));
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if accent_button(ui, "Отправить код").clicked() {
-                        app.save();
-                        let phone = app.cfg.phone.clone();
-                        let _ = app.tx.send(Command::LoginRequest { phone });
-                    }
-                    hint(ui, "Код придёт в Telegram (или SMS).");
-                });
-            }
-            LoginStage::AwaitingCode => {
-                row(ui, "Код из Telegram", |ui| {
-                    wide_edit(ui, &mut app.code_input, "12345");
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if accent_button(ui, "Войти").clicked() {
-                        let code = app.code_input.clone();
-                        let _ = app.tx.send(Command::LoginCode { code });
-                    }
-                    if ui.button("Отмена").clicked() {
-                        app.code_input.clear();
-                        let _ = app.tx.send(Command::LoginCancel);
-                    }
-                });
-            }
-            LoginStage::AwaitingPassword(hint_text) => {
-                row(ui, "Пароль 2FA", |ui| {
-                    let width = ui.available_width().max(90.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.password_input)
-                            .password(true)
-                            .hint_text("облачный пароль")
-                            .desired_width(width),
-                    );
-                });
-                if !hint_text.is_empty() {
-                    hint(ui, &format!("Подсказка от Telegram: {hint_text}"));
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if accent_button(ui, "Подтвердить").clicked() {
-                        let password = app.password_input.clone();
-                        let _ = app.tx.send(Command::LoginPassword { password });
-                    }
-                    if ui.button("Отмена").clicked() {
-                        app.password_input.clear();
-                        let _ = app.tx.send(Command::LoginCancel);
-                    }
-                });
-            }
-            LoginStage::Done(text) => {
-                pill(ui, "● сессия активна", OK);
-                ui.label(RichText::new(text).size(12.5).color(TEXT));
-            }
+        LoginStage::AwaitingCode => {
+            let code = bot.field("login.code", window, cx);
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(common::hint(
+                    &*cx,
+                    "Код уже отправлен. Если в логе «уходит в приложение Telegram» — искать его в чате «Telegram» (777000), а не в SMS.",
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Код из Telegram",
+                    common::wide_input(&code),
+                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(login_code_button(cx))
+                        .child(cancel_button(cx)),
+                )
+                .into_any_element()
         }
-    });
+        LoginStage::AwaitingPassword(hint_text) => {
+            let password = bot.field("login.password", window, cx);
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(common::hint(
+                    &*cx,
+                    format!("Подсказка от Telegram: {hint_text}"),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Пароль 2FA",
+                    common::wide_input(&password),
+                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(password_button(cx))
+                        .child(cancel_button(cx)),
+                )
+                .into_any_element()
+        }
+        LoginStage::Done(who) => v_flex()
+            .w_full()
+            .gap_2()
+            .child(common::pill(&*cx, "● сессия активна", theme::ok(&*cx)))
+            .child(common::hint(&*cx, format!("Вошли как {who}.")))
+            .child(common::hint(
+                &*cx,
+                "Сессия лежит в папке tdata рядом с exe.",
+            ))
+            .into_any_element(),
+    }
 }
 
-/// Настройки приложения: API-ключи, бот, ник, файл сессии.
-fn settings_card(app: &mut App, ui: &mut egui::Ui) {
-    card(ui, "Telegram", |ui| {
-        row(ui, "API ID", |ui| {
-            ui.add(egui::DragValue::new(&mut app.cfg.api_id).speed(1.0));
-        });
-        row(ui, "API hash", |ui| {
-            wide_edit(ui, &mut app.cfg.api_hash, "0123456789abcdef");
-        });
-        row(ui, "Телефон", |ui| {
-            wide_edit(ui, &mut app.cfg.phone, "+79991234567");
-        });
-        row(ui, "Бот", |ui| {
-            wide_edit(ui, &mut app.cfg.bot_username, "realgorillabot");
-        });
-        row(ui, "Ник игрока", |ui| {
-            wide_edit(ui, &mut app.cfg.player_name, "");
-        });
-        hint(
-            ui,
-            "По нику проверяем, что ответ бота адресован вам, а не другому игроку.",
-        );
-        row(ui, "Файл сессии", |ui| {
-            wide_edit(ui, &mut app.cfg.session_file, "gorilla.session");
-        });
-        hint(ui, "Лежит в папке tdata рядом с exe.");
-    });
+fn login_button(cx: &Context<Bot>) -> Button {
+    let this = cx.entity().downgrade();
+    Button::new("login-request")
+        .label("Войти по коду")
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            let _ = this.update(cx, |this: &mut Bot, cx| {
+                this.save();
+                let phone = this.value("phone");
+                this.send(Command::LoginRequest { phone });
+                cx.notify();
+            });
+        })
 }
 
-fn accent_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        Button::new(RichText::new(text).color(Color32::WHITE))
-            .fill(ACCENT)
-            .min_size(egui::Vec2::new(0.0, 26.0)),
+fn login_code_button(cx: &Context<Bot>) -> Button {
+    let this = cx.entity().downgrade();
+    Button::new("login-code").label("Войти").primary().on_click(
+        move |_: &ClickEvent, _window, cx| {
+            let _ = this.update(cx, |this: &mut Bot, cx| {
+                let code = this.field_text("login.code", cx);
+                this.send(Command::LoginCode { code });
+                cx.notify();
+            });
+        },
     )
+}
+
+fn password_button(cx: &Context<Bot>) -> Button {
+    let this = cx.entity().downgrade();
+    Button::new("login-password")
+        .label("Подтвердить")
+        .primary()
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            let _ = this.update(cx, |this: &mut Bot, cx| {
+                let password = this.field_text("login.password", cx);
+                this.send(Command::LoginPassword { password });
+                cx.notify();
+            });
+        })
+}
+
+fn cancel_button(cx: &Context<Bot>) -> Button {
+    let this = cx.entity().downgrade();
+    Button::new("login-cancel")
+        .label("Отмена")
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            let _ = this.update(cx, |this: &mut Bot, cx| {
+                this.send(Command::LoginCancel);
+                cx.notify();
+            });
+        })
 }

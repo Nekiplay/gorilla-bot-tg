@@ -7,9 +7,13 @@
   "proxy": null,
   "mtproxy": {
     "host": "127.0.0.1",
-    "port": 1443,
+    "port": 8444,
     "secret": "",
-    "worker": ""
+    "worker": "",
+    "cf_domains": [],
+    "pool_size": 2,
+    "probe_parallel": 20,
+    "score_ttl": 600
   },
   "casino": {
     "command": "Казино {bet}",

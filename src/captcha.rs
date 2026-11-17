@@ -97,7 +97,12 @@ pub fn selected(text: &str) -> Option<Vec<usize>> {
 }
 
 /// Разбирает картинку капчи: сетка + плитки.
-pub fn parse(message_id: i32, prompt: String, image: &[u8], buttons: Vec<Button>) -> Result<Captcha, String> {
+pub fn parse(
+    message_id: i32,
+    prompt: String,
+    image: &[u8],
+    buttons: Vec<Button>,
+) -> Result<Captcha, String> {
     let img = trim_padding(
         image::load_from_memory(image)
             .map_err(|e| format!("картинка капчи не читается: {e}"))?
@@ -112,14 +117,8 @@ pub fn parse(message_id: i32, prompt: String, image: &[u8], buttons: Vec<Button>
     let mut tiles = Vec::with_capacity(cols * rows);
     for row in 0..rows as u32 {
         for col in 0..cols as u32 {
-            let tile = image::imageops::crop_imm(
-                &img,
-                col * tile_w,
-                row * tile_h,
-                tile_w,
-                tile_h,
-            )
-            .to_image();
+            let tile = image::imageops::crop_imm(&img, col * tile_w, row * tile_h, tile_w, tile_h)
+                .to_image();
             tiles.push(tile.into_raw());
         }
     }
@@ -191,7 +190,11 @@ fn cuts(img: &RgbaImage, along_x: bool) -> usize {
         let mut lo = u8::MAX;
         let mut hi = 0u8;
         for j in 0..other {
-            let px = if along_x { img.get_pixel(i, j) } else { img.get_pixel(j, i) };
+            let px = if along_x {
+                img.get_pixel(i, j)
+            } else {
+                img.get_pixel(j, i)
+            };
             lo = lo.min(px[0]).min(px[1]).min(px[2]);
             hi = hi.max(px[0]).max(px[1]).max(px[2]);
         }
@@ -319,7 +322,11 @@ pub fn remember(dir: &Path, x: &[f32], needed: bool) -> std::io::Result<()> {
         .create(true)
         .append(true)
         .open(dir.join("samples.txt"))?;
-    let mut line = if needed { String::from("1") } else { String::from("0") };
+    let mut line = if needed {
+        String::from("1")
+    } else {
+        String::from("0")
+    };
     for v in x {
         let _ = write!(line, " {v:.5}");
     }
@@ -351,8 +358,16 @@ pub fn train(dir: &Path) -> Option<Model> {
     // Балансируем классы: «нужных» плиток всегда меньше.
     let pos = samples.iter().filter(|(_, n)| *n).count() as f32;
     let neg = samples.len() as f32 - pos;
-    let w_pos = if pos > 0.0 { samples.len() as f32 / (2.0 * pos) } else { 1.0 };
-    let w_neg = if neg > 0.0 { samples.len() as f32 / (2.0 * neg) } else { 1.0 };
+    let w_pos = if pos > 0.0 {
+        samples.len() as f32 / (2.0 * pos)
+    } else {
+        1.0
+    };
+    let w_neg = if neg > 0.0 {
+        samples.len() as f32 / (2.0 * neg)
+    } else {
+        1.0
+    };
 
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     let mut next = move || {

@@ -1,201 +1,267 @@
+//! Общие кусочки страниц: карточка, подпись, строка «ключ — значение»,
+//! пилюля состояния и круговой таймер.
+
 use std::time::Duration;
 
-use eframe::egui::{self, *};
+use super::theme;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::progress::ProgressCircle;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{Sizable, Size};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    div, px, App, Div, Entity, FontWeight, Hsla, IntoElement, SharedString, Styled, Window,
+};
 
-// Тёмная палитра с фиолетовым акцентом.
-pub(super) const BG: Color32 = Color32::from_rgb(15, 16, 22);
-pub(super) const CARD: Color32 = Color32::from_rgb(26, 28, 37);
-pub(super) const FIELD: Color32 = Color32::from_rgb(20, 22, 29);
-pub(super) const BORDER: Color32 = Color32::from_rgb(40, 43, 55);
-pub(super) const TEXT: Color32 = Color32::from_rgb(228, 231, 240);
-pub(super) const TEXT_DIM: Color32 = Color32::from_rgb(196, 201, 214);
-pub(super) const MUTED: Color32 = Color32::from_rgb(140, 146, 165);
-pub(super) const ACCENT: Color32 = Color32::from_rgb(124, 92, 255);
-pub(super) const ACCENT_LIGHT: Color32 = Color32::from_rgb(178, 160, 255);
-pub(super) const ACCENT_DIM: Color32 = Color32::from_rgb(64, 50, 128);
-pub(super) const OK: Color32 = Color32::from_rgb(80, 210, 130);
-pub(super) const WARN: Color32 = Color32::from_rgb(240, 180, 80);
-pub(super) const DANGER: Color32 = Color32::from_rgb(235, 90, 100);
+/// Карточка: фон группы, мягкая граница, скругление.
+pub fn card(cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        .gap_2()
+        .p_4()
+        .rounded(px(8.))
+        .bg(theme::card(cx))
+        .border_1()
+        .border_color(theme::border(cx))
+        // В карточке фиксированные высоты (графики, поля): сжиматься нельзя,
+        // иначе на маленьком окне их режет, а страница не прокручивается.
+        .flex_shrink_0()
+}
 
-/// Карточка-секция: скруглённая подложка с заголовком.
-/// Круговой таймер до следующей отправки команды.
-pub(super) fn timer_ring(
-    ui: &mut egui::Ui,
-    title: &str,
+/// Карточка с заголовком и готовым содержимым.
+pub fn card_with(cx: &App, title: impl Into<SharedString>, body: impl IntoElement) -> Div {
+    card(cx).child(card_title(cx, title)).child(body)
+}
+/// Заголовок карточки.
+pub fn card_title(cx: &App, text: impl Into<SharedString>) -> Div {
+    v_flex().w_full().pb_1().child(
+        Label::new(text.into())
+            .text_size(px(14.5))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::text(cx)),
+    )
+}
+
+/// Пояснение под заголовком.
+pub fn hint(cx: &App, text: impl Into<SharedString>) -> Div {
+    div().w_full().child(
+        Label::new(text.into())
+            .text_size(px(12.))
+            .text_color(theme::muted(cx)),
+    )
+}
+
+/// Строка «ключ — значение»: слева приглушённая подпись, справа текст.
+pub fn row(cx: &App, label: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .items_baseline()
+        .child(
+            div().w(px(190.)).flex_none().child(
+                Label::new(label.into())
+                    .text_size(px(13.))
+                    .text_color(theme::muted(cx)),
+            ),
+        )
+        .child(
+            div().flex_1().min_w_0().child(
+                Label::new(value.into())
+                    .text_size(px(13.))
+                    .text_color(theme::text(cx)),
+            ),
+        )
+}
+
+/// Крупное число с подписью: для метрик казино и обзора.
+pub fn stat(
+    cx: &App,
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    color: Hsla,
+) -> Div {
+    v_flex()
+        .gap_0p5()
+        .px_3()
+        .py_2()
+        .rounded(px(6.))
+        .bg(theme::field(cx))
+        .child(
+            Label::new(value.into())
+                .text_size(px(19.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color),
+        )
+        .child(
+            Label::new(label.into())
+                .text_size(px(11.5))
+                .text_color(theme::muted(cx)),
+        )
+}
+
+/// Пилюля состояния: подкрашенный фон и цветной текст.
+pub fn pill(_cx: &App, text: impl Into<SharedString>, color: Hsla) -> Div {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded(px(999.))
+        .bg(color.opacity(0.14))
+        .child(
+            Label::new(text.into())
+                .text_size(px(11.5))
+                .text_color(color),
+        )
+}
+
+/// Остаток времени как `чч:мм:сс` (`мм:сс`, если меньше часа).
+pub fn fmt_dur(left: Duration) -> String {
+    let total = left.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// Время суток `чч:мм` по местному часовому поясу.
+pub fn local_hhmm(unix: i64) -> String {
+    let local = time::OffsetDateTime::from_unix_timestamp(unix)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+        .to_offset(local_offset());
+    format!("{:02}:{:02}", local.hour(), local.minute())
+}
+
+/// Подпись часа: `14:00` — графики строятся по часовым замерам.
+pub fn local_hour(unix: i64) -> String {
+    let local = time::OffsetDateTime::from_unix_timestamp(unix)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+        .to_offset(local_offset());
+    format!("{:02}:00", local.hour())
+}
+
+/// Смещение местного пояса от UTC.
+fn local_offset() -> time::UtcOffset {
+    time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
+}
+
+/// Когда отправляли в прошлый раз: `был 14:02` или `ещё не было`.
+pub fn ago(unix: Option<i64>) -> String {
+    match unix {
+        Some(unix) => format!("был {}", local_hhmm(unix)),
+        None => "ещё не было".into(),
+    }
+}
+
+/// Круговой таймер команды: кольцо прогресса, подпись и остаток.
+/// Раскладывает элементы по строкам вручную: `flex_wrap` в GPUI считает высоту
+/// контейнера как одну строку, поэтому перенос делаем сами — тогда высота
+/// страницы верная и прокрутка доходит до низа.
+pub fn rows<T: IntoElement>(cells: Vec<T>, per_row: usize) -> Div {
+    let per_row = per_row.max(1);
+    let mut column = v_flex().w_full().gap_2();
+    let mut rest = cells.into_iter();
+
+    loop {
+        let mut row = h_flex().w_full().gap_2().items_stretch();
+        let mut taken = 0;
+        for cell in rest.by_ref().take(per_row) {
+            row = row.child(div().flex_1().min_w_0().child(cell));
+            taken += 1;
+        }
+        if taken == 0 {
+            break;
+        }
+        column = column.child(row);
+    }
+
+    column
+}
+
+/// Сколько ячеек шириной `cell` влезает в страницу при текущем размере окна.
+pub fn columns(window: &Window, cell: f32) -> usize {
+    let width = window.viewport_size().width.as_f32() - super::RAIL - super::LOG_WIDTH - 32. - 8.;
+    (((width + 8.) / (cell + 8.)).floor() as usize).clamp(1, 7)
+}
+
+pub fn timer_ring(
+    cx: &App,
+    title: &'static str,
     enabled: bool,
     left: Option<Duration>,
     total_secs: u64,
     last: Option<i64>,
-    color: Color32,
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(164.0, 202.0), Sense::hover());
-    let painter = ui.painter();
-    let center = rect.center();
-    let radius = 54.0;
+    color: Hsla,
+) -> Div {
+    let total = Duration::from_secs(total_secs.max(1));
+    let left = left.unwrap_or_default();
+    let done = total.saturating_sub(left).as_secs_f32() / total.as_secs_f32();
+    let percent = (done * 100.).clamp(0., 100.);
 
-    painter.circle_stroke(center, radius, Stroke::new(9.0, BORDER));
-
-    let frac = match (enabled, left) {
-        (false, _) => 0.0,
-        (true, None) => 1.0,
-        (true, Some(left)) => (1.0 - left.as_secs_f32() / total_secs.max(1) as f32).clamp(0.0, 1.0),
-    };
-
-    if frac > 0.004 {
-        let steps = 96;
-        let start = -std::f32::consts::FRAC_PI_2;
-        let points: Vec<egui::Pos2> = (0..=steps)
-            .map(|i| {
-                let angle = start + frac * std::f32::consts::TAU * (i as f32 / steps as f32);
-                egui::pos2(
-                    center.x + radius * angle.cos(),
-                    center.y + radius * angle.sin(),
-                )
-            })
-            .collect();
-        painter.add(egui::Shape::line(points, Stroke::new(9.0, color)));
-    }
-
-    let (main, sub) = match (enabled, left) {
-        (false, _) => ("выкл".to_string(), "автокоманда".to_string()),
-        (true, None) => ("—".to_string(), "ждёт запуска".to_string()),
-        (true, Some(left)) => (
-            fmt_dur(left),
-            format!("из {}", fmt_dur(Duration::from_secs(total_secs))),
-        ),
-    };
-    painter.text(
-        center - Vec2::new(0.0, 6.0),
-        Align2::CENTER_CENTER,
-        main,
-        FontId::proportional(18.0),
-        TEXT,
-    );
-    painter.text(
-        center + Vec2::new(0.0, 14.0),
-        Align2::CENTER_CENTER,
-        sub,
-        FontId::proportional(10.5),
-        MUTED,
-    );
-
-    painter.text(
-        egui::pos2(center.x, rect.bottom() - 32.0),
-        Align2::CENTER_TOP,
-        title,
-        FontId::proportional(14.0),
-        TEXT,
-    );
-    painter.text(
-        egui::pos2(center.x, rect.bottom() - 13.0),
-        Align2::CENTER_TOP,
-        match last {
-            Some(ts) => format!("была в {}", local_hhmm(ts)),
-            None => "ещё не запускалась".to_string(),
-        },
-        FontId::proportional(11.0),
-        MUTED,
-    );
-}
-
-/// Карточка-секция: скруглённая подложка с заголовком.
-pub(super) fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(6)
-        .inner_margin(Margin::same(14))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().size(14.5).color(TEXT));
-            ui.add_space(6.0);
-            add(ui);
-        });
-    ui.add_space(9.0);
-}
-
-pub(super) fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [140.0, 22.0],
-            Label::new(RichText::new(label).size(13.0).color(MUTED)),
-        );
-        add(ui);
-    });
-}
-
-pub(super) fn wide_edit(ui: &mut egui::Ui, text: &mut String, hint_text: &str) {
-    let width = ui.available_width().max(90.0);
-    ui.add(
-        TextEdit::singleline(text)
-            .hint_text(hint_text)
-            .desired_width(width),
-    );
-}
-
-pub(super) fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.5).color(MUTED));
-}
-
-pub(super) fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
-    Frame::new()
-        .fill(color.gamma_multiply(0.18))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.45)))
-        .corner_radius(5)
-        .inner_margin(Margin::symmetric(9, 3))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(12.0).color(color));
-        });
-}
-
-pub(super) fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-    Frame::new()
-        .fill(FIELD)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(5)
-        .inner_margin(Margin::symmetric(12, 7))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(label).size(11.0).color(MUTED));
-                ui.label(RichText::new(value).size(18.0).strong().color(color));
-            });
-        });
-}
-
-pub(super) fn fmt_dur(d: Duration) -> String {
-    let s = d.as_secs();
-    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
-}
-
-pub(super) fn local_hhmm(ts: i64) -> String {
-    use time::OffsetDateTime;
-    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    match OffsetDateTime::from_unix_timestamp(ts) {
-        Ok(t) => {
-            let t = t.to_offset(offset);
-            format!(
-                "{:02}.{:02} {:02}:{:02}",
-                t.day(),
-                t.month() as u8,
-                t.hour(),
-                t.minute()
-            )
-        }
-        Err(_) => "—".to_string(),
-    }
-}
-
-pub(super) fn ago(ts: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let diff = (now - ts).max(0) as u64;
-    if diff < 60 {
-        "только что".to_string()
-    } else if diff < 3600 {
-        format!("{} мин назад", diff / 60)
+    let (caption, caption_color) = if !enabled {
+        ("выключено".to_string(), theme::muted(cx))
+    } else if left.is_zero() {
+        ("отправляю".to_string(), color)
     } else {
-        format!("{} ч {} мин назад", diff / 3600, diff % 3600 / 60)
-    }
+        (fmt_dur(left), theme::text_dim(cx))
+    };
+
+    v_flex()
+        .w(px(168.))
+        .items_center()
+        .gap_2()
+        .p_3()
+        .rounded(px(8.))
+        .bg(theme::card(cx))
+        .border_1()
+        .border_color(theme::border(cx))
+        .child(
+            ProgressCircle::new(title_key(&title))
+                .value(percent)
+                .color(if enabled { color } else { theme::muted(cx) })
+                .with_size(Size::Large),
+        )
+        .child(
+            Label::new(title)
+                .text_size(px(13.))
+                .text_color(theme::text(cx)),
+        )
+        .child(
+            Label::new(caption)
+                .text_size(px(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(caption_color),
+        )
+        .child(
+            Label::new(ago(last))
+                .text_size(px(11.))
+                .text_color(theme::muted(cx)),
+        )
+}
+
+/// Устойчивый идентификатор кольца из его подписи.
+fn title_key(title: &str) -> SharedString {
+    SharedString::from(format!("ring-{}", title.to_string()))
+}
+
+/// Поле ввода на всю ширину карточки.
+pub fn wide_input(state: &Entity<InputState>) -> Input {
+    Input::new(state).w_full()
+}
+
+/// Строка с полем ввода: подпись слева, поле справа.
+pub fn field_row(cx: &App, label: impl Into<SharedString>, field: impl IntoElement) -> Div {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .items_center()
+        .child(
+            div().w(px(190.)).flex_none().child(
+                Label::new(label.into())
+                    .text_size(px(13.))
+                    .text_color(theme::muted(cx)),
+            ),
+        )
+        .child(div().flex_1().min_w_0().child(field))
 }

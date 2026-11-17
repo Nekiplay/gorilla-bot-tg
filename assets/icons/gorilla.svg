@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="24" height="24" viewBox="0 0 24 24">
+  <title>Untitled-1</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <polygon id="head" points="6,9 9,5.6 13,4.6 17.4,6.6 19.4,10.6 19.2,15 16.6,19.4 12.4,20.4 8.2,18.8 5.6,15.2 5.4,11.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle id="ear-left" cx="4.6" cy="14.7" r="2.3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-miterlimit="10"/>
+    <circle id="ear-right" cx="19.4" cy="14.7" r="2.3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-miterlimit="10"/>
+    <line id="brow-left" x1="8.4" y1="9.4" x2="11.6" y2="9.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-miterlimit="10"/>
+    <line id="brow-right" x1="13.4" y1="9.4" x2="15.6" y2="9.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-miterlimit="10"/>
+    <line id="eye-left" x1="9.6" y1="12.4" x2="9.6" y2="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-miterlimit="10"/>
+    <line id="eye-right" x1="14.4" y1="12.4" x2="14.4" y2="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path id="muzzle" d="M9.8 15.4 C10.4 16.3 11.1 16.8 12 16.8 C12.9 16.8 13.6 16.3 14.2 15.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-miterlimit="10"/>
+    <line id="nose" x1="12" y1="13.4" x2="12" y2="14.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-miterlimit="10"/>
+  </g>
+</svg>

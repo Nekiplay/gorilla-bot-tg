@@ -1,83 +1,99 @@
-use eframe::egui::{self, *};
+//! Профиль игрока из чата с ботом.
 
-use super::App;
-use super::common::*;
-use crate::engine::{Command, Status};
+use super::{charts, common, theme, Bot};
+use crate::engine::Command;
+use gpui_kit::component::label::Label;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::{px, AnyElement, Context, ParentElement, Styled, Window};
 
-/// Профиль игрока (ответ бота на «Профиль»).
-pub(super) fn profile_page(app: &mut App, ui: &mut egui::Ui, _status: &Status) {
-    let profile = app.shared.profile();
-    let last = app.shared.last_profile();
+/// Страница «Профиль».
+pub(super) fn page(bot: &mut Bot, _window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let profile = bot.shared.profile();
+    let last = bot.shared.last_profile();
+    let refresh = bot.primary_action("profile-refresh", "Обновить", || Command::ProfileNow, cx);
 
-    card(ui, "Профиль", |ui| {
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    Button::new(RichText::new("Обновить").size(13.0).color(Color32::WHITE))
-                        .fill(ACCENT)
-                        .corner_radius(4)
-                        .min_size(Vec2::new(0.0, 28.0)),
-                )
-                .clicked()
-            {
-                let _ = app.tx.send(Command::ProfileNow);
-            }
+    let header = h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .child(refresh)
+        .child(common::hint(
+            &*cx,
             match last {
-                Some(ts) => hint(ui, &format!("обновлён {}", ago(ts))),
-                None => hint(ui, "ещё не запрашивали"),
-            }
-        });
-        ui.add_space(8.0);
+                Some(ts) => format!("обновлён {}", common::ago(Some(ts))),
+                None => "ещё не запрашивали".to_string(),
+            },
+        ));
 
-        let Some(p) = profile.as_ref() else {
-            hint(ui, "Запросите профиль у бота кнопкой «Обновить».");
-            return;
-        };
+    let mut body = v_flex().w_full().gap_2().child(header);
 
-        ui.horizontal(|ui| {
-            if let Some(clan) = &p.clan {
-                pill(ui, &format!("клан {clan}"), ACCENT_LIGHT);
-            }
-            if p.vip {
-                pill(ui, "VIP", WARN);
-            }
-            if let Some(level) = &p.level {
-                pill(ui, &format!("уровень {level}"), OK);
-            }
-        });
-        ui.add_space(8.0);
+    let Some(profile) = profile else {
+        return body
+            .child(common::hint(
+                &*cx,
+                "Запросите профиль у бота кнопкой «Обновить».",
+            ))
+            .into_any_element();
+    };
 
-        let fields: [(&str, &Option<String>); 12] = [
-            ("ID", &p.id),
-            ("Telegram", &p.telegram),
-            ("Наличными", &p.cash),
-            ("В банке", &p.bank),
-            ("Биткоинов", &p.bitcoins),
-            ("Рейтинг", &p.rating),
-            ("Энергия", &p.energy),
-            ("Опыт", &p.experience),
-            ("GB", &p.gb),
-            ("Регистрация", &p.registered),
-            ("Возраст", &p.age),
-            ("Клан", &p.clan),
-        ];
-        for (label, value) in fields {
-            if let Some(value) = value {
-                row(ui, label, |ui| {
-                    ui.label(RichText::new(value).size(13.5).color(TEXT));
-                });
-            }
+    let mut badges = h_flex().w_full().gap_2();
+    if let Some(clan) = &profile.clan {
+        badges = badges.child(common::pill(
+            &*cx,
+            format!("клан {clan}"),
+            theme::accent_light(&*cx),
+        ));
+    }
+    if profile.vip {
+        badges = badges.child(common::pill(&*cx, "VIP", theme::warn(&*cx)));
+    }
+    if let Some(level) = &profile.level {
+        badges = badges.child(common::pill(
+            &*cx,
+            format!("уровень {level}"),
+            theme::ok(&*cx),
+        ));
+    }
+    body = body.child(badges);
+
+    for (label, value) in [
+        ("ID", profile.id.clone()),
+        ("Telegram", profile.telegram.clone()),
+        ("Наличными", profile.cash.clone()),
+        ("В банке", profile.bank.clone()),
+        ("Биткоинов", profile.bitcoins.clone()),
+        ("Рейтинг", profile.rating.clone()),
+        ("Энергия", profile.energy.clone()),
+        ("Опыт", profile.experience.clone()),
+        ("GB", profile.gb.clone()),
+        ("Регистрация", profile.registered.clone()),
+        ("Возраст", profile.age.clone()),
+        ("Клан", profile.clan.clone()),
+    ] {
+        if let Some(value) = value {
+            body = body.child(common::row(&*cx, label, value));
         }
+    }
 
-        if !p.property.is_empty() {
-            ui.add_space(6.0);
-            ui.label(RichText::new("Имущество").size(13.0).strong().color(TEXT_DIM));
-            for (key, value) in &p.property {
-                row(ui, key, |ui| {
-                    ui.label(RichText::new(value).size(13.0).color(TEXT));
-                });
-            }
+    if !profile.property.is_empty() {
+        body = body.child(
+            Label::new("Имущество")
+                .text_size(px(13.))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(theme::text_dim(&*cx)),
+        );
+        for (label, value) in &profile.property {
+            body = body.child(common::row(&*cx, label.clone(), value.clone()));
         }
-    });
+    }
 
+    let history = bot.shared.history();
+
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(common::card_with(cx, "Профиль", body))
+        .child(charts::cash(&*cx, &history, charts::money_color(&*cx)))
+        .into_any_element()
 }

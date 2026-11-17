@@ -1,4 +1,4 @@
-//! Локальный SOCKS5-мост к MTProto-прокси (например, TgWsProxy на 127.0.0.1:1443).
+//! Локальный SOCKS5-мост к MTProto-прокси (стандартный порт 8444).
 //!
 //! grammers умеет ходить только через SOCKS5, а TgWsProxy принимает входные
 //! MTProto-подключения с dd-секретом (obfuscated2, AES-256-CTR). Этот модуль
@@ -12,15 +12,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
+use futures_util::{SinkExt as _, StreamExt as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -31,6 +32,94 @@ use tokio_tungstenite::tungstenite::Message;
 /// Открытый WSS-туннель (воркер или CF-прокси).
 type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
+
+/// Параметры пула из `config.json` (`mtproxy.pool_size` и соседи).
+static POOL_SIZE: AtomicUsize = AtomicUsize::new(2);
+// По умолчанию 20: стандартный пул tg-ws-proxy — 20 доменов, и весь он
+// пробуется одним забегом, т.е. время до ошибки — один таймаут, а не 20.
+static PROBE_PARALLEL: AtomicUsize = AtomicUsize::new(20);
+static SCORE_TTL_SECS: AtomicU64 = AtomicU64::new(600);
+
+/// Применить настройки балансировщика и пула из конфига.
+pub fn configure(mt: &crate::config::MtProxyConfig) {
+    POOL_SIZE.store(mt.pool_size.min(8), Ordering::Relaxed);
+    PROBE_PARALLEL.store(mt.probe_parallel.clamp(1, 32), Ordering::Relaxed);
+    SCORE_TTL_SECS.store(mt.score_ttl.max(30), Ordering::Relaxed);
+}
+
+/// Сколько готовых туннелей держать на DC (0 — пул выключен).
+fn pool_size() -> usize {
+    POOL_SIZE.load(Ordering::Relaxed)
+}
+
+/// Сколько доменов пробовать одновременно в одном забеге.
+fn probe_parallel() -> usize {
+    PROBE_PARALLEL.load(Ordering::Relaxed).max(1)
+}
+
+/// Сколько секунд живёт замер (для таблицы и `--check`).
+pub fn score_ttl_secs() -> u64 {
+    SCORE_TTL_SECS.load(Ordering::Relaxed)
+}
+
+/// Сколько живёт замер задержки домена.
+fn score_ttl() -> Duration {
+    Duration::from_secs(SCORE_TTL_SECS.load(Ordering::Relaxed))
+}
+
+/// Записать в балансировщик исход рукопожатия с доменом.
+fn record_score(dc: i16, domain: &str, handshake: Option<Duration>) {
+    let Ok(mut scores) = crate::balancer::global().lock() else {
+        return;
+    };
+    let now = crate::balancer::now();
+    let ttl = score_ttl();
+    match handshake {
+        Some(elapsed) => scores.record_success(dc, domain, elapsed, now, ttl),
+        None => scores.record_failure(dc, domain, now, ttl),
+    }
+}
+
+/// Домен-лидер по счёту для DC, если замер уже есть.
+fn best_candidate(dc: i16) -> Option<String> {
+    crate::balancer::global()
+        .lock()
+        .ok()
+        .and_then(|scores| scores.best(dc, crate::balancer::now(), score_ttl()))
+        .map(|(domain, _)| domain)
+}
+
+/// План попытки: сначала лидер по счёту (если он есть в списке и на него
+/// есть свежий замер), остальные домены — для забега.
+fn attempt_plan(dc: i16, mut order: Vec<String>) -> (Option<String>, Vec<String>) {
+    let Some(leader) = best_candidate(dc) else {
+        return (None, order);
+    };
+    match order.iter().position(|domain| domain == &leader) {
+        Some(idx) => {
+            order.remove(idx);
+            (Some(leader), order)
+        }
+        None => (None, order),
+    }
+}
+
+/// Проверить, что пулу есть куда идти: пустой список — понятная ошибка.
+fn domains_for(dc: i16, domains: Vec<String>) -> Result<Vec<String>, String> {
+    if domains.is_empty() {
+        return Err(format!("список CF-прокси пуст, DC{dc} некуда слать"));
+    }
+    Ok(domains)
+}
+
+/// Прогреть счёт перед показом таблицы (использует `--check`): делает по
+/// одному забегу на DC и отпускает туннели.
+pub async fn score_pool(dcs: &[i16]) {
+    let attempts = dcs.iter().map(|dc| async move {
+        let _ = pool().connect_one(*dc).await;
+    });
+    futures_util::future::join_all(attempts).await;
+}
 /// Стандартные CF-прокси из Flowseal/tg-ws-proxy (`proxy/config.py`,
 /// список `_CFPROXY_ENC`) — те же домены после `_dd()`: буквы каждой метки
 /// сдвинуты назад на их количество, TLD заменён на `.co.uk`.
@@ -57,6 +146,202 @@ pub const CF_PROXY_DOMAINS: &[&str] = &[
     "stopblocking.co.uk",
     "nothingthere.co.uk",
 ];
+
+/// Список доменов, по которому ходит пул: стартуем с зашитых, потом
+/// подменяем свежими из репозитория tg-ws-proxy.
+static CF_DOMAINS: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+
+fn cf_domains_store() -> &'static std::sync::Mutex<Vec<String>> {
+    CF_DOMAINS.get_or_init(|| {
+        std::sync::Mutex::new(CF_PROXY_DOMAINS.iter().map(|d| d.to_string()).collect())
+    })
+}
+
+/// Текущий список доменов пула.
+pub fn cf_domains() -> Vec<String> {
+    cf_domains_store().lock().unwrap().clone()
+}
+
+/// Принять свежий список (как ежечасный refresh в tg-ws-proxy).
+/// Возвращает число принятых доменов; при мусоре список не меняется.
+pub fn set_cf_domains(list: Vec<String>) -> usize {
+    let mut cleaned: Vec<String> = Vec::new();
+    for item in list {
+        let d = item.trim().to_ascii_lowercase();
+        let ok = d.len() > 3
+            && d.len() < 254
+            && d.contains('.')
+            && !d.starts_with('.')
+            && !d.ends_with('.')
+            && d.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        if !ok || cleaned.iter().any(|x| *x == d) {
+            continue;
+        }
+        cleaned.push(d);
+    }
+    // Апстрим тоже держится правила «минимум три живых домена».
+    if cleaned.len() < 3 {
+        return 0;
+    }
+    let count = cleaned.len();
+    *cf_domains_store().lock().unwrap() = cleaned;
+    count
+}
+
+/// Разобрать список доменов: по строке на домен, `#` — комментарий.
+/// Принимаем и «закодированный» вид апстрима (`xxx.com`), и готовый `.co.uk`.
+pub fn parse_cf_domains(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(decode_cf_domain_line)
+        .collect()
+}
+
+/// `.github/cfproxy-domains.txt` апстрима содержит кодированные имена.
+fn decode_cf_domain_line(line: &str) -> String {
+    if !line.ends_with(".com") {
+        return line.to_string();
+    }
+    let label = &line[..line.len() - 4];
+    let shift = (label.chars().filter(|c| c.is_ascii_alphabetic()).count() % 26) as u32;
+    let mut out = String::with_capacity(line.len());
+    for ch in label.chars() {
+        if ch.is_ascii_alphabetic() {
+            let base = if ch.is_ascii_lowercase() { b'a' } else { b'A' } as u32;
+            let idx = (ch as u32 - base + 26 - shift) % 26;
+            out.push(char::from_u32(base + idx).unwrap_or(ch));
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push_str(".co.uk");
+    out
+}
+
+/// Результат проверки пула: живой домен (если есть) и причины отказов.
+pub struct PoolProbe {
+    pub live: Option<String>,
+    pub reasons: Vec<String>,
+}
+
+/// Как апстрим: список доменов берём из `.github/cfproxy-domains.txt`
+/// репозитория tg-ws-proxy — он обновляется там, домены протухают.
+const CF_DOMAINS_URL_PATH: &str = "/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt";
+const CF_DOMAINS_URL_HOST: &str = "raw.githubusercontent.com";
+
+/// Один HTTPS GET (без сторонних HTTP-клиентов: TLS есть под рукой).
+async fn https_get(host: &str, path: &str, timeout: Duration) -> Result<String, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("имя {host}: {e}"))?;
+    let tcp = TcpStream::connect((host, 443))
+        .await
+        .map_err(|e| format!("TCP {host}:443: {e}"))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("TLS {host}: {e}"))?;
+    let req = format!(
+        "GET {path} HTTP/1.1
+Host: {host}
+User-Agent: gorilla-bot
+Connection: close
+
+"
+    );
+    tls.write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("запрос {host}: {e}"))?;
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(timeout, tls.read_to_end(&mut raw)).await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("{host}: пустой ответ"))?;
+    let status = head.lines().next().unwrap_or_default().to_string();
+    if !status.contains(" 200 ") {
+        return Err(format!("{host}: {status}"));
+    }
+    // `Connection: close` + chunked бывает; для списка доменов это текст.
+    Ok(body.to_string())
+}
+
+/// Обновить список доменов пула из репозитория tg-ws-proxy.
+/// Возвращает число принятых доменов; при сбое список остаётся прежним.
+pub async fn refresh_cf_domains() -> Result<usize, String> {
+    let text = https_get(
+        CF_DOMAINS_URL_HOST,
+        CF_DOMAINS_URL_PATH,
+        Duration::from_secs(8),
+    )
+    .await?;
+    let list = parse_cf_domains(&text);
+    let accepted = set_cf_domains(list);
+    if accepted == 0 {
+        return Err(format!(
+            "список из репозитория не принят (доменов в ответе: {})",
+            text.lines().filter(|l| !l.trim().is_empty()).count()
+        ));
+    }
+    Ok(accepted)
+}
+
+/// Жив ли стандартный пул из этой сети. Cloudflare маршрутизирует по SNI,
+/// поэтому честный тест один: попробовать WSS-рукопожатие к нескольким
+/// доменам. Причины отказов возвращаем наружу — их печатает `--check`.
+pub async fn cf_pool_probe() -> PoolProbe {
+    let domains = cf_domains();
+    let mut reasons = Vec::new();
+    if domains.is_empty() {
+        reasons.push("список доменов пула пуст".to_string());
+        return PoolProbe {
+            live: None,
+            reasons,
+        };
+    }
+    let step = (domains.len() / 4).max(1);
+    let picks: Vec<String> = domains.iter().step_by(step).take(4).cloned().collect();
+    let mut tasks = Vec::new();
+    for domain in picks {
+        tasks.push(async move {
+            let host = cf_proxy_host(&domain, 2);
+            let url = format!("wss://{host}/apiws");
+            match tokio::time::timeout(
+                Duration::from_secs(6),
+                connect_ws(&url, "таймаут WSS-подключения"),
+            )
+            .await
+            {
+                Ok(Ok(_ws)) => Ok(host),
+                Ok(Err(e)) => Err(format!("{host}: {e}")),
+                Err(_) => Err(format!("{host}: нет ответа за 6 c (TLS/WS)")),
+            }
+        });
+    }
+    for found in futures_util::future::join_all(tasks).await {
+        match found {
+            Ok(host) if !host.is_empty() => {
+                return PoolProbe {
+                    live: Some(host),
+                    reasons,
+                }
+            }
+            Ok(_) => {}
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    PoolProbe {
+        live: None,
+        reasons,
+    }
+}
 
 pub type AesCtr256 = Ctr128BE<Aes256>;
 
@@ -137,9 +422,7 @@ struct Target {
 /// Разбор секрета: «dd<32hex>» или чистые 32 hex-символа.
 pub fn parse_secret(raw: &str) -> Result<[u8; 16], String> {
     let raw = raw.trim();
-    let hex = if raw.len() == 34
-        && (raw.starts_with("dd") || raw.starts_with("ee"))
-    {
+    let hex = if raw.len() == 34 && (raw.starts_with("dd") || raw.starts_with("ee")) {
         &raw[2..]
     } else {
         raw
@@ -148,7 +431,9 @@ pub fn parse_secret(raw: &str) -> Result<[u8; 16], String> {
         .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
         .collect();
     let bytes = bytes.map_err(|_| format!("не удалось разобрать секрет «{raw}»"))?;
-    bytes.try_into().map_err(|_| "секрет должен быть 16 байт".into())
+    bytes
+        .try_into()
+        .map_err(|_| "секрет должен быть 16 байт".into())
 }
 
 fn make_cipher(key: &[u8], iv: &[u8]) -> AesCtr256 {
@@ -203,7 +488,10 @@ fn generate_client_handshake(
         enc_key.update(&handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
         enc_key.update(secret);
         let enc_key: [u8; 32] = enc_key.finalize().into();
-        let mut enc = make_cipher(&enc_key, &handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]);
+        let mut enc = make_cipher(
+            &enc_key,
+            &handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN],
+        );
         let mut dummy = [0u8; HANDSHAKE_LEN];
         enc.apply_keystream(&mut dummy);
 
@@ -242,7 +530,10 @@ fn generate_relay_handshake(dc_idx: i16) -> ([u8; HANDSHAKE_LEN], AesCtr256, Aes
         if RESERVED_FIRST_BYTES.contains(&handshake[0]) {
             continue;
         }
-        if RESERVED_STARTS.iter().any(|start| handshake[..4] == start[..]) {
+        if RESERVED_STARTS
+            .iter()
+            .any(|start| handshake[..4] == start[..])
+        {
             continue;
         }
 
@@ -256,9 +547,7 @@ fn generate_relay_handshake(dc_idx: i16) -> ([u8; HANDSHAKE_LEN], AesCtr256, Aes
 
         // Шифр от DC: перевёрнутые prekey+IV, без промотки и без хеша.
         let mut reversed = [0u8; PREKEY_LEN + IV_LEN];
-        reversed.copy_from_slice(
-            &handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN],
-        );
+        reversed.copy_from_slice(&handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]);
         reversed.reverse();
         let dec = make_cipher(&reversed[..PREKEY_LEN], &reversed[PREKEY_LEN..]);
 
@@ -271,6 +560,132 @@ fn generate_relay_handshake(dc_idx: i16) -> ([u8; HANDSHAKE_LEN], AesCtr256, Aes
         }
 
         return (handshake, enc, dec);
+    }
+}
+
+/// Что отвечает на `host:port` локального прокси.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalKind {
+    /// Порт отвечает SOCKS5-приветствием без пароля — можно отдать адрес grammers как есть.
+    Socks5,
+    /// Порт открыт, но SOCKS5 не здоровается: похоже на MTProto-прокси (нужен секрет).
+    Open,
+    /// Порт закрыт или не отвечает — локального прокси нет.
+    Closed,
+}
+
+impl LocalKind {
+    /// Человеческое описание для лога и `--check`.
+    pub fn describe(self, host: &str, port: u16) -> String {
+        match self {
+            Self::Socks5 => format!("{host}:{port} отвечает как SOCKS5 — ходим через него напрямую"),
+            Self::Open => format!(
+                "{host}:{port} открыт, но SOCKS5 не отвечает: это MTProto-прокси, ему нужен mtproxy.secret"
+            ),
+            Self::Closed => format!("{host}:{port} закрыт — локального прокси нет"),
+        }
+    }
+}
+
+/// Последняя причина, по которой мост не смог получить живой ответ.
+static LAST_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn last_reason() -> Option<String> {
+    LAST_REASON.lock().ok().and_then(|slot| slot.clone())
+}
+
+fn remember_reason(text: String) {
+    if let Ok(mut slot) = LAST_REASON.lock() {
+        *slot = Some(text);
+    }
+}
+
+/// Настройки локального TgWsProxy (Flowseal/tg-ws-proxy): адрес, порт и
+/// секрет из его собственного `config.json` (`%APPDATA%\TgWsProxy\config.json`).
+/// Нужно, чтобы бот подключался к уже запущенному прокси, даже если в
+/// `config.json` бота `mtproxy.secret` пуст и порт отличается от стандартного.
+///
+/// Домен собственного Cloudflare-worker из настроек TgWsProxy
+/// (`cfproxy_worker_domain[0]`): публичный пул `kws*.*` часто не отвечает,
+/// а свой воркер у того же пользователя работает.
+///
+/// Воркер из настроек TgWsProxy: `(домен, включён ли он в самом TgWsProxy)`.
+///
+/// Второй элемент важен: если пользователь выключил свой воркер
+/// (`cfproxy_worker_enabled: false`), молча ходить через него нельзя —
+/// решение принимает вызывающий и говорит об этом в логе.
+pub fn tgws_worker_domain() -> Option<(String, bool)> {
+    let base = std::env::var_os("APPDATA")?;
+    let path = std::path::PathBuf::from(base)
+        .join("TgWsProxy")
+        .join("config.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let domains = value.get("cfproxy_worker_domain")?;
+    let first = match domains {
+        serde_json::Value::Array(items) => items.first()?.as_str()?.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        _ => return None,
+    };
+    let trimmed = first
+        .trim()
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let enabled = value
+        .get("cfproxy_worker_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    Some((trimmed.to_string(), enabled))
+}
+
+pub fn tgws_local() -> Option<(String, u16, [u8; 16])> {
+    let base = std::env::var_os("APPDATA")?;
+    let path = std::path::PathBuf::from(base)
+        .join("TgWsProxy")
+        .join("config.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let port = u16::try_from(value.get("port")?.as_u64()?).ok()?;
+    let host = value
+        .get("host")
+        .and_then(|host| host.as_str())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let secret = parse_secret(value.get("secret")?.as_str()?).ok()?;
+    Some((host, port, secret))
+}
+
+/// Проба локального прокси: сначала TCP-коннект, затем SOCKS5-приветствие
+/// (`05 01 00` → ждём `05 00`). Ничего не логирует, зовётся и из `--check`,
+/// и при выборе маршрута подключения.
+pub async fn probe_local(host: &str, port: u16) -> LocalKind {
+    let addr = format!("{host}:{port}");
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        TcpStream::connect(&addr),
+    )
+    .await;
+    let mut stream = match connect {
+        Ok(Ok(stream)) => stream,
+        _ => return LocalKind::Closed,
+    };
+
+    // Метод «без авторизации»; сервер обязан ответить версией и выбранным методом.
+    if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+        return LocalKind::Open;
+    }
+    let mut reply = [0u8; 2];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(1200),
+        stream.read_exact(&mut reply),
+    )
+    .await;
+    match read {
+        Ok(Ok(_)) if reply == [0x05, 0x00] => LocalKind::Socks5,
+        _ => LocalKind::Open,
     }
 }
 
@@ -384,7 +799,10 @@ async fn socks_accept(client: &mut TcpStream) -> Result<(IpAddr, i16), String> {
         .await
         .map_err(|e| format!("methods: {e}"))?;
     if !methods.contains(&0) {
-        client.write_all(&[5, 0xff]).await.map_err(|e| e.to_string())?;
+        client
+            .write_all(&[5, 0xff])
+            .await
+            .map_err(|e| e.to_string())?;
         return Err("клиент требует SOCKS5-авторизацию".into());
     }
     client
@@ -435,7 +853,9 @@ async fn socks_accept(client: &mut TcpStream) -> Result<(IpAddr, i16), String> {
 
     let Some(dc_idx) = dc_by_ip(dst_ip) else {
         socks_reply(client, 2).await?;
-        return Err(format!("адрес {dst_ip} не опознан как известный DC Telegram"));
+        return Err(format!(
+            "адрес {dst_ip} не опознан как известный DC Telegram"
+        ));
     };
 
     socks_reply(client, 0).await?;
@@ -472,7 +892,10 @@ async fn latch_upstream(
 
     let media_idx = if dc_idx > 0 { -dc_idx } else { dc_idx };
     let started = tokio::time::Instant::now();
-    let overall = started + std::time::Duration::from_secs(300);
+    let overall = started + std::time::Duration::from_secs(120);
+    // Сколько раз прокси принимал подключение, но не сказал ни байта:
+    // если такое повторяется, дело в его собственном апстриме, а не в нас.
+    let mut silent_rounds = 0u32;
 
     for attempt in 1..=MAX_ATTEMPTS {
         if tokio::time::Instant::now() >= overall {
@@ -583,18 +1006,36 @@ async fn latch_upstream(
                 up_plain.len(),
                 started.elapsed().as_secs_f32()
             );
-            return Ok(Latched { upstream, enc, dec, backlog: up_plain, sent });
+            return Ok(Latched {
+                upstream,
+                enc,
+                dec,
+                backlog: up_plain,
+                sent,
+            });
         }
         let reason = if bad_frame != 0 {
             format!("мусорный кадр len={bad_frame}")
         } else if echo_skipped < 64 {
-            format!("эхо {echo_skipped}/64")
+            if echo_skipped == 0 {
+                format!(
+                    "прокси молчит {:.0} c: подключение принято, но апстрим прокси не ответил",
+                    ATTEMPT_TIMEOUT.as_secs_f32()
+                )
+            } else {
+                format!("эхо {echo_skipped}/64")
+            }
         } else if up_plain.is_empty() {
             "эхо есть, кадра нет".to_string()
         } else {
             format!("обрыв на {} Б кадра", up_plain.len())
         };
         println!("[мост] попытка {attempt} ({route_name}): апстрим «{reason}» — редайал");
+        if echo_skipped == 0 && bad_frame == 0 {
+            silent_rounds += 1;
+        } else {
+            silent_rounds = 0;
+        }
         let _ = upstream.shutdown().await;
         // Не_DDoSим прокси и CF: сначала быстро ловим окно, дальше всё реже.
         let gap = if attempt < 5 {
@@ -605,12 +1046,25 @@ async fn latch_upstream(
             std::time::Duration::from_secs(20)
         };
         tokio::time::sleep(gap).await;
+        if silent_rounds >= 3 {
+            break;
+        }
     }
 
-    Err(format!(
-        "ни один сокет прокси не отдал живой ответ за {:.0} c — канал мёртв",
-        started.elapsed().as_secs()
-    ))
+    let verdict = if silent_rounds >= 3 {
+        format!(
+            "прокси {target_addr} принимает подключение, но {silent_rounds} раза подряд молчал по {:.0} c — не отвечает его собственный апстрим; проверь лог TgWsProxy (proxy.log)",
+            ATTEMPT_TIMEOUT.as_secs_f32(),
+            target_addr = target.addr,
+        )
+    } else {
+        format!(
+            "ни один сокет прокси не отдал живой ответ за {:.0} c — канал мёртв",
+            started.elapsed().as_secs()
+        )
+    };
+    remember_reason(verdict.clone());
+    Err(verdict)
 }
 
 /// Полный цикл одного клиента: SOCKS5-переговоры → obfuscated2-рукопожатие
@@ -655,13 +1109,29 @@ pub async fn spawn_worker_bridge(worker: String) -> Result<SocketAddr, String> {
 
 /// WSS-подключение к воркеру/CF-прокси с заголовком, который они ожидают.
 async fn connect_ws(url: &str, timeout_msg: &str) -> Result<WsStream, String> {
+    match connect_ws_once(url, timeout_msg, true).await {
+        // Часть воркеров (в т.ч. собственный воркер TgWsProxy) не подтверждает
+        // subprotocol «binary» — им достаточно обычного WSS-рукопожатия.
+        Err(e) if e.to_lowercase().contains("subprotocol") => {
+            connect_ws_once(url, timeout_msg, false).await
+        }
+        other => other,
+    }
+}
+
+async fn connect_ws_once(
+    url: &str,
+    timeout_msg: &str,
+    want_subprotocol: bool,
+) -> Result<WsStream, String> {
     let mut request = url
         .into_client_request()
         .map_err(|e| format!("адрес {url}: {e}"))?;
-    request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_static("binary"),
-    );
+    if want_subprotocol {
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("binary"));
+    }
 
     let (ws, response) = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -765,7 +1235,6 @@ impl MsgSplitter {
     }
 }
 
-
 /// Двусторонняя пересылка: клиентский сокет ↔ WSS-туннель.
 async fn pump(
     mut client: TcpStream,
@@ -835,7 +1304,6 @@ async fn pump(
                     }
                 }
             }
-
         }
     };
 
@@ -848,10 +1316,7 @@ async fn pump(
 /// Одно клиентское подключение через worker: SOCKS5 → WSS → DC.
 async fn serve_worker_client(mut client: TcpStream, worker: &str) -> Result<(), String> {
     let (dst_ip, dc_idx) = socks_accept(&mut client).await?;
-    let url = format!(
-        "wss://{worker}/apiws?dst={dst_ip}&dc={}",
-        dc_idx.abs()
-    );
+    let url = format!("wss://{worker}/apiws?dst={dst_ip}&dc={}", dc_idx.abs());
 
     let mut ws = connect_ws(&url, &format!("таймаут WSS-подключения к {worker}")).await?;
     let (init, enc, dec) = generate_relay_handshake(dc_idx);
@@ -860,7 +1325,6 @@ async fn serve_worker_client(mut client: TcpStream, worker: &str) -> Result<(), 
         .map_err(|e| format!("воркер: рукопожатие: {e}"))?;
     pump(client, ws, enc, dec, Proto::Intermediate, "воркер").await
 }
-
 
 /// Хост CF-прокси для нужного DC: `kws<dc>.<домен>` (так же в tg-ws-proxy).
 fn cf_proxy_host(domain: &str, dc_idx: i16) -> String {
@@ -882,8 +1346,6 @@ struct CfProxyPool {
     idle: Mutex<HashMap<i16, VecDeque<PooledWs>>>,
     refilling: Mutex<HashSet<i16>>,
     rotating: Mutex<HashSet<i16>>,
-    /// Домен, который сработал для DC: его пробуем первым (как balancer.py).
-    pinned: Mutex<HashMap<i16, usize>>,
     failures: Mutex<HashMap<i16, u32>>,
     retry_after: Mutex<HashMap<i16, Instant>>,
 }
@@ -892,8 +1354,6 @@ struct CfProxyPool {
 const POOL_MAX_AGE: Duration = Duration::from_secs(100);
 /// Как часто проверять живость пула.
 const POOL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-/// Сколько готовых туннелей держим на один DC.
-const POOL_PER_DC: usize = 2;
 
 static CF_POOL: OnceLock<CfProxyPool> = OnceLock::new();
 
@@ -907,7 +1367,6 @@ impl CfProxyPool {
             idle: Mutex::new(HashMap::new()),
             refilling: Mutex::new(HashSet::new()),
             rotating: Mutex::new(HashSet::new()),
-            pinned: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             retry_after: Mutex::new(HashMap::new()),
         }
@@ -915,6 +1374,12 @@ impl CfProxyPool {
 
     /// Туннель для DC: готовый из пула, иначе — свежий (и сразу пополнить).
     async fn acquire(self: &'static Self, dc: i16) -> Result<WsStream, String> {
+        if pool_size() == 0 {
+            let (ws, host) = self.connect_one(dc).await?;
+            println!("[cf-прокси] DC{dc} через {host} (пул выключен)");
+            return Ok(ws);
+        }
+
         let mut taken = None;
         {
             let mut idle = self.idle.lock().await;
@@ -970,7 +1435,7 @@ impl CfProxyPool {
                     bucket.retain(|entry| entry.created.elapsed() < POOL_MAX_AGE);
                     bucket.len()
                 };
-                if ready < POOL_PER_DC {
+                if ready < pool_size() {
                     pool().kick_refill(dc).await;
                 }
                 tokio::time::sleep(POOL_CHECK_INTERVAL).await;
@@ -998,7 +1463,7 @@ impl CfProxyPool {
         let mut connected = 0u32;
         loop {
             let have = self.idle.lock().await.get(&dc).map_or(0, |b| b.len());
-            if have >= POOL_PER_DC {
+            if have >= pool_size() {
                 break;
             }
             match self.connect_one(dc).await {
@@ -1008,7 +1473,10 @@ impl CfProxyPool {
                         .await
                         .entry(dc)
                         .or_default()
-                        .push_back(PooledWs { ws, created: Instant::now() });
+                        .push_back(PooledWs {
+                            ws,
+                            created: Instant::now(),
+                        });
                     connected += 1;
                 }
                 Err(e) => {
@@ -1037,25 +1505,116 @@ impl CfProxyPool {
         }
     }
 
-    /// Подключение к CF-прокси для DC, начиная с закреплённого домена.
+    /// Подключение к CF-прокси для DC: параллельный забег по доменам.
+    ///
+    /// Порядок берётся у балансировщика (лучший счёт первым), первые
+    /// `probe_parallel` доменов пробуются одновременно — побеждает тот, кто
+    /// первым закончил рукопожатие. Исход каждого идёт в счёт.
     async fn connect_one(&self, dc: i16) -> Result<(WsStream, String), String> {
-        let count = CF_PROXY_DOMAINS.len();
-        let start = *self.pinned.lock().await.get(&dc).unwrap_or(&0) % count;
+        let domains = domains_for(dc, cf_domains())?;
+        let order = {
+            let Ok(scores) = crate::balancer::global().lock() else {
+                return Err("счёт балансировщика отравлен".to_string());
+            };
+            scores.order(dc, &domains, crate::balancer::now(), score_ttl())
+        };
+        let batch = probe_parallel();
+        let rest = order;
         let mut last_err = String::new();
 
-        for step in 0..count {
-            let idx = (start + step) % count;
-            let host = cf_proxy_host(CF_PROXY_DOMAINS[idx], dc);
+        // Сначала один домен — лидер по счёту. Забег включается только
+        // при промахе, поэтому измеренный лидер реально определяет выбор,
+        // а не гоняется вслепую вместе со всем пулом.
+        let (leader, mut rest) = attempt_plan(dc, rest);
+        if let Some(best) = leader {
+            let host = cf_proxy_host(&best, dc);
             let url = format!("wss://{host}/apiws");
+            eprintln!("[cf-прокси] DC{dc}: пробую лучший по счёту {best}");
+            let started = Instant::now();
             match connect_ws(&url, &format!("таймаут WSS-подключения к {host}")).await {
                 Ok(ws) => {
-                    self.pinned.lock().await.insert(dc, idx);
+                    let elapsed = started.elapsed();
+                    record_score(dc, &best, Some(elapsed));
+                    println!("[cf-прокси] DC{dc}: лучший сервер — {best}");
+                    eprintln!(
+                        "[cf-прокси] {best}: рукопожатие за {} мс, счёт {:.2}",
+                        elapsed.as_millis(),
+                        elapsed.as_secs_f64()
+                    );
                     return Ok((ws, host));
                 }
                 Err(e) => {
-                    eprintln!("[cf-прокси] {host}: {e}");
+                    record_score(dc, &best, None);
+                    eprintln!("[cf-прокси] {best}: {e} — перехожу к забегу");
                     last_err = e;
                 }
+            }
+        }
+
+        while !rest.is_empty() {
+            let take = batch.min(rest.len());
+            let racers: Vec<String> = rest.drain(..take).collect();
+            let mut set: tokio::task::JoinSet<(String, Result<WsStream, String>, Duration)> =
+                tokio::task::JoinSet::new();
+            for domain in racers {
+                set.spawn(async move {
+                    let host = cf_proxy_host(&domain, dc);
+                    let url = format!("wss://{host}/apiws");
+                    let started = Instant::now();
+                    let res = connect_ws(&url, &format!("таймаут WSS-подключения к {host}")).await;
+                    (domain, res, started.elapsed())
+                });
+            }
+
+            let mut winner: Option<(String, WsStream)> = None;
+            // После победы даём остальным полсекунды, чтобы их задержки тоже
+            // попали в счёт, и отпускаем ожидание.
+            let mut grace: Option<Instant> = None;
+            loop {
+                let next = match grace {
+                    Some(deadline) => {
+                        match tokio::time::timeout_at(deadline.into(), set.join_next()).await {
+                            Ok(next) => next,
+                            Err(_) => break,
+                        }
+                    }
+                    None => set.join_next().await,
+                };
+                let Some(joined) = next else { break };
+                match joined {
+                    Ok((domain, Ok(ws), elapsed)) => {
+                        record_score(dc, &domain, Some(elapsed));
+                        let score = {
+                            let now = crate::balancer::now();
+                            let ttl = score_ttl();
+                            crate::balancer::global()
+                                .lock()
+                                .ok()
+                                .and_then(|scores| scores.lookup(dc, &domain, now, ttl))
+                        }
+                        .unwrap_or(elapsed.as_secs_f64());
+                        eprintln!(
+                            "[cf-прокси] {domain}: рукопожатие за {} мс, счёт {score:.2}",
+                            elapsed.as_millis()
+                        );
+                        if winner.is_none() {
+                            winner = Some((domain, ws));
+                            grace = Some(Instant::now() + Duration::from_millis(500));
+                        }
+                    }
+                    Ok((domain, Err(e), _)) => {
+                        record_score(dc, &domain, None);
+                        eprintln!("[cf-прокси] {domain}: {e}");
+                        last_err = e;
+                    }
+                    Err(e) => last_err = format!("проба оборвалась: {e}"),
+                }
+            }
+            drop(set);
+
+            if let Some((domain, ws)) = winner {
+                println!("[cf-прокси] DC{dc}: лучший сервер — {domain}");
+                return Ok((ws, cf_proxy_host(&domain, dc)));
             }
         }
 
@@ -1078,11 +1637,44 @@ pub async fn spawn_cfproxy_bridge() -> Result<SocketAddr, String> {
 
     println!(
         "[cf-прокси] локальный SOCKS5: {local} → {} стандартных доменов tg-ws-proxy, пул прогретых туннелей",
-        CF_PROXY_DOMAINS.len()
+        cf_domains().len()
     );
 
     // Прогреваем туннель к первому DC: к первому подключению grammers он уже готов.
     tokio::spawn(async { pool().spawn_refill(2).await });
+
+    // Как апстрим: список доменов обновляем раз в час — домены протухают.
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            match refresh_cf_domains().await {
+                Ok(count) => println!("[cf-прокси] домены пула обновлены из репозитория: {count}"),
+                Err(e) => eprintln!("[cf-прокси] обновление доменов не удалось: {e}"),
+            }
+        }
+    });
+
+    // Балансировщик: раз в 5 минут гоняет забег по доменам для основных DC,
+    // чтобы счёт не вырождался в «кто один раз ответил первым».
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(Duration::from_secs(300));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if pool_size() == 0 {
+                continue;
+            }
+            for dc in [2i16, 4] {
+                match pool().connect_one(dc).await {
+                    Ok((ws, host)) => {
+                        drop(ws);
+                        println!("[балансировщик] DC{dc}: лучший сервер — {host}");
+                    }
+                    Err(e) => eprintln!("[балансировщик] DC{dc}: {e}"),
+                }
+            }
+        }
+    });
 
     tokio::spawn(async move {
         loop {
@@ -1139,7 +1731,9 @@ async fn serve_client(mut client: TcpStream, target: &Target) -> Result<(), Stri
             .await
             .map_err(|e| format!("досыл клиентских байтов: {e}"))?;
     }
-    let Latched { upstream, enc, dec, .. } = latched;
+    let Latched {
+        upstream, enc, dec, ..
+    } = latched;
     relay(client, upstream, enc, dec).await
 }
 
@@ -1161,14 +1755,20 @@ async fn relay(
         async move {
             let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let n = from_client.read(&mut buf).await.map_err(|e| e.to_string())?;
+                let n = from_client
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if n == 0 {
                     to_upstream.shutdown().await.map_err(|e| e.to_string())?;
                     return Ok::<(), String>(());
                 }
                 let data = &mut buf[..n];
                 enc.lock().await.apply_keystream(data);
-                to_upstream.write_all(data).await.map_err(|e| e.to_string())?;
+                to_upstream
+                    .write_all(data)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
         }
     };
@@ -1177,7 +1777,10 @@ async fn relay(
         async move {
             let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let n = from_upstream.read(&mut buf).await.map_err(|e| e.to_string())?;
+                let n = from_upstream
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if n == 0 {
                     to_client.shutdown().await.map_err(|e| e.to_string())?;
                     return Ok::<(), String>(());
@@ -1190,4 +1793,81 @@ async fn relay(
     };
 
     tokio::try_join!(up, down).map(|_| ())
+}
+
+#[cfg(test)]
+mod local_probe_tests {
+    use super::{probe_local, LocalKind};
+
+    /// Стандартный пул — 20 доменов; забег должен покрывать его целиком,
+    /// иначе время до ошибки растёт кратно числу пачек по 6 секунд.
+    #[test]
+    fn default_probe_parallel_covers_standard_pool() {
+        let batch = super::probe_parallel();
+        assert!(batch >= 20, "параллельных проб {batch}, а доменов 20");
+    }
+
+    /// Измеренный лидер идёт первым, остальные — на забег.
+    #[test]
+    fn plan_takes_scored_leader_first() {
+        super::record_score(91, "kws2.fast", Some(std::time::Duration::from_millis(150)));
+        super::record_score(91, "kws2.slow", Some(std::time::Duration::from_millis(1500)));
+        let order = vec!["kws2.slow".to_string(), "kws2.fast".to_string()];
+        let (leader, rest) = super::attempt_plan(91, order);
+        assert_eq!(leader.as_deref(), Some("kws2.fast"));
+        assert_eq!(rest, vec!["kws2.slow".to_string()]);
+    }
+
+    /// Без замеров лидера нет — весь список уходит на забег.
+    #[test]
+    fn plan_without_scores_races_everything() {
+        let order = vec!["kws2.a".to_string(), "kws2.b".to_string()];
+        let (leader, rest) = super::attempt_plan(92, order.clone());
+        assert!(leader.is_none());
+        assert_eq!(rest, order);
+    }
+
+    /// Пустой список доменов — понятная ошибка без единого сетевого запроса.
+    #[test]
+    fn pool_without_domains_reports_error() {
+        let err = super::domains_for(2, Vec::new()).unwrap_err();
+        assert!(err.contains("список CF-прокси пуст"), "err: {err}");
+        let list = vec!["kws2.x.co.uk".to_string()];
+        assert_eq!(super::domains_for(2, list.clone()).unwrap(), list);
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Закрытый порт: проба не должна висеть и обязана сказать Closed.
+    #[tokio::test]
+    async fn closed_port() {
+        assert_eq!(probe_local("127.0.0.1", 1).await, LocalKind::Closed);
+    }
+
+    /// Мини-SOCKS5 отвечает `05 00` — значит через него можно ходить напрямую.
+    #[tokio::test]
+    async fn socks5_greeting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            socket.write_all(&[0x05, 0x00]).await.unwrap();
+        });
+        assert_eq!(probe_local("127.0.0.1", port).await, LocalKind::Socks5);
+        server.await.unwrap();
+    }
+
+    /// Молчащий порт — это MTProto-прокси без SOCKS5, ему нужен секрет.
+    #[tokio::test]
+    async fn silent_port_is_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        assert_eq!(probe_local("127.0.0.1", port).await, LocalKind::Open);
+        server.abort();
+    }
 }

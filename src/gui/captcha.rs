@@ -1,201 +1,214 @@
-//! Вкладка «Капча»: бот присылает картинку, игрок отмечает нужные плитки,
-//! движок нажимает inline-кнопки «1»…«Готово» и дообучает модель.
+//! Капча: сетка плиток, выбор нужных и отправка боту.
 
-use eframe::egui::{self, Color32, FontId, RichText, Sense, Stroke, Vec2};
+use std::sync::Arc;
 
-use super::common::*;
-use super::App;
-use crate::captcha as model;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 
-/// Что окно помнит о текущей капче: текстуры плиток и отметки.
+use super::{common, theme, Bot};
+use crate::captcha::{self, Captcha};
+
+/// Кэш картинок плиток между кадрами.
 #[derive(Default)]
 pub(super) struct Viewer {
     message_id: i32,
-    tiles: Vec<egui::TextureHandle>,
+    /// Текстуры плиток в том же порядке, что и у капчи.
+    tiles: Vec<Arc<RenderImage>>,
+    /// Отметки игрока по плиткам.
     selected: Vec<bool>,
 }
 
-/// Страница «Капча».
-pub(super) fn captcha_card(app: &mut App, ui: &mut egui::Ui) {
-    let note = app.shared.captcha_note();
-    let pending = app.shared.captcha();
-    let samples = sample_count();
-
-    card(ui, "Капча", |ui| {
-        if !note.is_empty() {
-            hint(ui, &note);
-            ui.add_space(4.0);
-        }
-
-        let Some(captcha) = pending else {
-            ui.label(
-                RichText::new("Сейчас капчи нет.")
-                    .size(13.5)
-                    .color(TEXT_DIM),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!(
-                    "Размечено плиток: {samples}. Модель включается от {} штук.",
-                    model::MIN_SAMPLES
-                ))
-                .size(12.0)
-                .color(MUTED),
-            );
+impl Viewer {
+    /// Пересобирает картинки, если бот прислал новую капчу.
+    fn sync(&mut self, captcha: &Captcha) {
+        if self.message_id == captcha.message_id && self.tiles.len() == captcha.tiles.len() {
             return;
-        };
-
-        load_tiles(app, ui, &captcha);
-        if !captcha.prompt.trim().is_empty() {
-            ui.label(
-                RichText::new(captcha.prompt.lines().next().unwrap_or("").trim())
-                    .size(13.5)
-                    .color(TEXT),
-            );
         }
-        ui.label(
-            RichText::new(format!(
-                "{} плиток ({}×{}) — отметь нужные и нажми «Отправить».",
-                captcha.tiles.len(),
-                captcha.cols,
-                captcha.rows
-            ))
-            .size(12.5)
-            .color(MUTED),
-        );
-        ui.add_space(6.0);
-
-        let side = tile_side(ui, captcha.tile_w, captcha.tile_h, captcha.cols);
-        let mut flips = Vec::new();
-        for row in 0..captcha.rows {
-            ui.horizontal(|ui| {
-                for col in 0..captcha.cols {
-                    let index = row * captcha.cols + col;
-                    let Some(tex) = app.captcha_view.tiles.get(index) else {
-                        continue;
-                    };
-                    let selected = app.captcha_view.selected.get(index).copied().unwrap_or(false);
-                    let guess = captcha.guess.get(index).copied().unwrap_or(0.0);
-                    if draw_tile(ui, tex, side, selected, guess) {
-                        flips.push(index);
-                    }
-                }
-            });
-        }
-        for index in flips {
-            if let Some(cell) = app.captcha_view.selected.get_mut(index) {
-                *cell = !*cell;
-            }
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Отправить").clicked() {
-                app.shared
-                    .submit_captcha(captcha.message_id, app.captcha_view.selected.clone());
-                app.shared.set_captcha_note("отправляю выбор боту…");
-            }
-            if ui.button("Очистить").clicked() {
-                app.captcha_view.selected = vec![false; captcha.tiles.len()];
-            }
-            if captcha.has_guess() && ui.button("Подсказка модели").clicked() {
-                app.captcha_view.selected = captcha.suggested();
-            }
-        });
-
-        let picked = app
-            .captcha_view
-            .selected
+        self.message_id = captcha.message_id;
+        self.tiles = captcha
+            .tiles
             .iter()
-            .enumerate()
-            .filter(|(_, on)| **on)
-            .count();
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("Отмечено плиток: {picked}"))
-                .size(12.0)
-                .color(TEXT_DIM),
-        );
-    });
-}
-
-/// Сколько примеров уже размечено (строк в samples.txt).
-fn sample_count() -> usize {
-    std::fs::read_to_string(model::model_dir().join("samples.txt"))
-        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0)
-}
-
-/// Пересобирает текстуры, когда пришла новая капча.
-fn load_tiles(app: &mut App, ui: &egui::Ui, captcha: &model::Captcha) {
-    if app.captcha_view.message_id == captcha.message_id {
-        return;
+            .filter_map(|rgba| render_tile(rgba, captcha))
+            .collect();
+        self.selected = vec![false; self.tiles.len()];
     }
-    let size = [captcha.tile_w as usize, captcha.tile_h as usize];
-    let tiles = captcha
-        .tiles
-        .iter()
-        .enumerate()
-        .map(|(index, pixels)| {
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, pixels);
-            ui.ctx().load_texture(
-                format!("captcha-{}-{index}", captcha.message_id),
-                image,
-                egui::TextureOptions::LINEAR,
-            )
-        })
-        .collect();
-    app.captcha_view.message_id = captcha.message_id;
-    app.captcha_view.tiles = tiles;
-    app.captcha_view.selected = captcha.suggested();
 }
 
-/// Размер плитки на экране: чтобы вся сетка влезла по ширине.
-fn tile_side(ui: &egui::Ui, tile_w: u32, tile_h: u32, cols: usize) -> Vec2 {
-    let max_w = (ui.available_width() - 12.0 * cols as f32) / cols.max(1) as f32;
-    let scale = (max_w / tile_w.max(1) as f32).clamp(0.35, 1.6);
-    Vec2::new(
-        tile_w as f32 * scale,
-        tile_h as f32 * scale,
-    )
+/// RGBA-плитка → картинка gpui.
+fn render_tile(rgba: &[u8], captcha: &Captcha) -> Option<Arc<RenderImage>> {
+    let buffer = image::RgbaImage::from_raw(captcha.tile_w, captcha.tile_h, rgba.to_vec())?;
+    let frame = image::Frame::new(buffer);
+    Some(Arc::new(RenderImage::new(vec![frame])))
 }
 
-/// Одна плитка: картинка, рамка выбора, метка модели. `true` — клик.
-fn draw_tile(
-    ui: &mut egui::Ui,
-    tex: &egui::TextureHandle,
-    side: Vec2,
-    selected: bool,
-    guess: f32,
-) -> bool {
-    let (rect, response) = ui.allocate_exact_size(side, Sense::click());
-    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+/// Страница «Капча».
+pub(super) fn page(bot: &mut Bot, _window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let captcha = bot.shared.captcha();
+    let note = bot.shared.captcha_note();
 
-    let stroke = if selected {
-        Stroke::new(3.0, ACCENT_LIGHT)
-    } else if response.hovered() {
-        Stroke::new(2.0, ACCENT)
-    } else {
-        Stroke::new(1.0, BORDER)
+    let Some(captcha) = captcha else {
+        return no_captcha(&note, cx);
     };
-    ui.painter().rect_stroke(rect, 4, stroke, egui::StrokeKind::Inside);
+    bot.captcha.sync(&captcha);
 
-    if guess >= 0.5 {
-        let dot = egui::Rect::from_min_size(
-            rect.left_top() + Vec2::new(4.0, 4.0),
-            Vec2::splat(7.0),
-        );
-        ui.painter().circle_filled(dot.center(), 3.5, OK);
+    let cols = captcha.cols.max(1);
+    let rows = captcha.rows.max(1);
+    let scale = (700.0 / (captcha.tile_w as f32 * cols as f32)).clamp(0.35, 1.4);
+    let tile_w = px(captcha.tile_w as f32 * scale);
+    let tile_h = px(captcha.tile_h as f32 * scale);
+
+    let mut grid = v_flex().w_full().gap_2();
+    for row in 0..rows {
+        let mut line = h_flex().w_full().gap_2();
+        for col in 0..cols {
+            let index = row * cols + col;
+            if index >= bot.captcha.tiles.len() {
+                break;
+            }
+            let selected = bot.captcha.selected.get(index).copied().unwrap_or(false);
+            let guess = captcha.guess.get(index).copied().unwrap_or(0.0);
+            let image = bot.captcha.tiles[index].clone();
+            let border = if selected {
+                theme::accent_light(&*cx)
+            } else {
+                theme::border(&*cx)
+            };
+
+            let mut tile = div()
+                .id(("tile", index))
+                .relative()
+                .w(tile_w)
+                .h(tile_h)
+                .rounded(px(6.))
+                .border_1()
+                .border_color(border)
+                .when(selected, |el| el.border_2())
+                .cursor_pointer()
+                .child(img(image).w(tile_w).h(tile_h).rounded(px(5.)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(flag) = this.captcha.selected.get_mut(index) {
+                        *flag = !*flag;
+                        cx.notify();
+                    }
+                }));
+
+            if guess >= 0.5 {
+                tile = tile.child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .left(px(4.))
+                        .w(px(8.))
+                        .h(px(8.))
+                        .rounded_full()
+                        .bg(theme::ok(&*cx)),
+                );
+            }
+            if selected {
+                tile = tile.child(
+                    div().absolute().bottom(px(2.)).right(px(4.)).child(
+                        Label::new("✓")
+                            .text_size(px(16.))
+                            .text_color(theme::accent_light(&*cx)),
+                    ),
+                );
+            }
+
+            line = line.child(tile);
+        }
+        grid = grid.child(line);
     }
-    if selected {
-        ui.painter().text(
-            rect.right_bottom() - Vec2::new(8.0, 8.0),
-            egui::Align2::RIGHT_BOTTOM,
-            "✓",
-            FontId::proportional(14.0),
-            ACCENT_LIGHT,
+
+    let picked = bot.captcha.selected.iter().filter(|on| **on).count();
+    let message_id = captcha.message_id;
+    let send = Button::new("captcha-submit")
+        .primary()
+        .label("Отправить")
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.shared
+                .submit_captcha(message_id, this.captcha.selected.clone());
+            this.shared.set_captcha_note("отправляю выбор боту…");
+            cx.notify();
+        }));
+
+    let clear = Button::new("captcha-clear")
+        .label("Очистить")
+        .on_click(cx.listener(|this, _, _, cx| {
+            for flag in &mut this.captcha.selected {
+                *flag = false;
+            }
+            cx.notify();
+        }));
+
+    let mut buttons = h_flex().w_full().gap_2().child(send).child(clear);
+    if captcha.has_guess() {
+        let hint = captcha.suggested();
+        buttons = buttons.child(
+            Button::new("captcha-hint")
+                .label("Подсказка модели")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.captcha.selected = hint.clone();
+                    cx.notify();
+                })),
         );
     }
-    response.clicked()
+
+    let title = captcha.prompt.lines().next().unwrap_or("Капча").to_string();
+
+    common::card_with(
+        cx,
+        "Капча",
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                Label::new(title)
+                    .text_size(px(15.))
+                    .text_color(theme::text(&*cx)),
+            )
+            .child(common::hint(
+                &*cx,
+                format!(
+                    "{} плиток ({}×{}) — отметь нужные и нажми «Отправить».",
+                    captcha.tiles.len(),
+                    cols,
+                    rows
+                ),
+            ))
+            .when(!note.is_empty(), |el| el.child(common::hint(&*cx, note)))
+            .child(grid)
+            .child(buttons)
+            .child(common::hint(&*cx, format!("Отмечено плиток: {picked}"))),
+    )
+    .into_any_element()
+}
+
+/// Заглушка, когда капчи нет.
+fn no_captcha(note: &str, cx: &mut Context<Bot>) -> AnyElement {
+    let marked = std::fs::read_to_string(captcha::model_dir().join("samples.txt"))
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+
+    let mut body = v_flex().w_full().gap_2().child(
+        Label::new("Сейчас капчи нет.")
+            .text_size(px(14.))
+            .text_color(theme::text(&*cx)),
+    );
+
+    if !note.is_empty() {
+        body = body.child(common::hint(&*cx, note));
+    }
+
+    body = body.child(common::hint(
+        &*cx,
+        format!(
+            "Размечено плиток: {marked}. Модель включается от {} штук.",
+            captcha::MIN_SAMPLES
+        ),
+    ));
+
+    common::card_with(cx, "Капча", body).into_any_element()
 }

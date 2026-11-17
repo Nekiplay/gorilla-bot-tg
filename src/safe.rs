@@ -35,7 +35,9 @@ impl Bag {
         let mut order: Vec<u32> = (MIN_CODE..=MAX_CODE).collect();
         let mut state = seed();
         for i in (1..order.len()).rev() {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let j = (state >> 33) as usize % (i + 1);
             order.swap(i, j);
         }
@@ -150,7 +152,10 @@ mod tests {
         for _ in 0..(MAX_CODE - MIN_CODE + 1) {
             let code = bag.next(None);
             assert!(!seen.contains(&code), "код {code} повторился");
-            assert!((MIN_CODE..=MAX_CODE).contains(&code), "код {code} вне 1..=99");
+            assert!(
+                (MIN_CODE..=MAX_CODE).contains(&code),
+                "код {code} вне 1..=99"
+            );
             seen.push(code);
         }
         assert_eq!(seen.len() as u32, MAX_CODE - MIN_CODE + 1);

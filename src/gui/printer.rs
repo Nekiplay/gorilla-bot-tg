@@ -1,123 +1,138 @@
-use std::time::Duration;
+//! Принтер: расписание «Принтер», заправка и снятие монет.
 
-use eframe::egui::{self, *};
-
-use super::App;
-use super::common::*;
+use super::{common, theme, Bot};
 use crate::engine::Command;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Context, ParentElement, Styled, Window};
 
-    pub(super) fn printer_card(
-        app: &mut App,
-        ui: &mut egui::Ui,
-        left: Option<Duration>,
-        last_printer: Option<i64>,
-    ) {
-        card(ui, "Принтер", |ui| {
-            ui.checkbox(
-                &mut app.cfg.printer.enabled,
-                RichText::new("Авто «Принтер» по расписанию").size(13.0).color(TEXT),
-            );
-            ui.checkbox(
-                &mut app.cfg.printer.auto_refill,
-                RichText::new("Автозаправка («Принтер заправить»)").size(13.0).color(TEXT),
-            );
-            ui.checkbox(
-                &mut app.cfg.printer.auto_withdraw,
-                RichText::new("Автоснятие денег («Принтер снять»)").size(13.0).color(TEXT),
-            );
+/// Страница «Принтер».
+pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
+    let command = bot.field("printer.command", window, cx);
+    let refill = bot.field("printer.refill_command", window, cx);
+    let withdraw = bot.field("printer.withdraw_command", window, cx);
+    let below = bot.field("printer.refill_below_percent", window, cx);
+    let interval = bot.field("printer.interval_secs", window, cx);
+    let jitter = bot.field("printer.interval_jitter_secs", window, cx);
+    let timeout = bot.field("printer.reply_timeout_secs", window, cx);
 
-            row(ui, "Команда", |ui| {
-                wide_edit(ui, &mut app.cfg.printer.command, "Принтер");
-            });
-            row(ui, "Заправка", |ui| {
-                wide_edit(ui, &mut app.cfg.printer.refill_command, "Принтер заправить");
-            });
-            row(ui, "Снятие", |ui| {
-                wide_edit(ui, &mut app.cfg.printer.withdraw_command, "Принтер снять");
-            });
-            row(ui, "Заправлять при ≤, %", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut app.cfg.printer.refill_below_percent)
-                        .speed(1.0)
-                        .range(1..=100),
-                );
-            });
-            row(ui, "Интервал, с", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut app.cfg.printer.interval_secs)
-                        .speed(60.0)
-                        .range(60..=86_400),
-                );
-            });
-            row(ui, "Разброс, с", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut app.cfg.printer.interval_jitter_secs)
-                        .speed(10.0)
-                        .range(0..=3_600),
-                );
-            });
-            row(ui, "Ждать ответ, с", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut app.cfg.printer.reply_timeout_secs).range(5..=300),
-                );
-            });
+    let cfg = bot.cfg.printer.clone();
+    let last = bot.shared.last_printer();
+    let left = bot.shared.next_printer_in();
+    let spread = (cfg.interval_jitter_secs / 60).max(1);
+    let hint = format!(
+        "{} ч {} мин +0..{spread} мин ({}–{} с)",
+        cfg.interval_secs / 3600,
+        cfg.interval_secs % 3600 / 60,
+        cfg.interval_secs,
+        cfg.interval_secs + cfg.interval_jitter_secs
+    );
 
-            let interval = app.cfg.printer.interval_secs;
-            let jitter = app.cfg.printer.interval_jitter_secs.min(interval);
-            hint(
-                ui,
-                &format!(
-                    "{} ч {} мин +0..{} мин ({}–{} с)",
-                    interval / 3600,
-                    interval % 3600 / 60,
-                    jitter / 60,
-                    interval,
-                    interval + jitter
+    let last_line = match last {
+        Some(ts) => format!("Последняя проверка: {}", common::ago(Some(ts))),
+        None => "Ещё не проверялся — уйдёт при старте.".to_string(),
+    };
+    let next_line = match left {
+        Some(left) => format!("Следующий принтер через {}", common::fmt_dur(left)),
+        None => "Авто-принтер выключен".to_string(),
+    };
+
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(common::card_with(
+            cx,
+            "Принтер",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(bot.flag("printer.enabled", "Авто «Принтер»", cfg.enabled, cx))
+                .child(bot.flag(
+                    "printer.auto_refill",
+                    "Заправлять, когда монет мало",
+                    cfg.auto_refill,
+                    cx,
+                ))
+                .child(bot.flag(
+                    "printer.auto_withdraw",
+                    "Снимать монеты в банк",
+                    cfg.auto_withdraw,
+                    cx,
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Команда",
+                    common::wide_input(&command),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Заправка",
+                    common::wide_input(&refill),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Снятие",
+                    common::wide_input(&withdraw),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Заправлять при ≤ %",
+                    common::wide_input(&below),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Интервал, с",
+                    common::wide_input(&interval),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Разброс, с",
+                    common::wide_input(&jitter),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "Ждать ответ, с",
+                    common::wide_input(&timeout),
+                ))
+                .child(common::hint(&*cx, hint))
+                .child(common::hint(&*cx, last_line))
+                .child(common::hint(&*cx, next_line).text_color(if left.is_some() {
+                    theme::accent_light(&*cx)
+                } else {
+                    theme::muted(&*cx)
+                }))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            bot.primary_action(
+                                "printer-now",
+                                "Проверить / обслужить сейчас",
+                                || Command::PrinterNow,
+                                cx,
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            bot.action(
+                                "printer-refill",
+                                "Заправить",
+                                || Command::PrinterRefillNow,
+                                cx,
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            bot.action(
+                                "printer-withdraw",
+                                "Снять",
+                                || Command::PrinterWithdrawNow,
+                                cx,
+                            )
+                            .flex_1(),
+                        ),
                 ),
-            );
-
-            ui.add_space(4.0);
-            match last_printer {
-                Some(ts) => hint(
-                    ui,
-                    &format!("Последняя проверка: {} ({})", local_hhmm(ts), ago(ts)),
-                ),
-                None => hint(ui, "Ещё не проверялся — уйдёт при старте."),
-            }
-            match left {
-                Some(d) => {
-                    ui.label(
-                        RichText::new(format!("Следующий принтер через {}", fmt_dur(d)))
-                            .color(ACCENT_LIGHT),
-                    );
-                }
-                None => hint(ui, "Авто-принтер выключен"),
-            }
-
-            ui.add_space(4.0);
-            if ui
-                .add(
-                    Button::new("Проверить / обслужить сейчас")
-                        .min_size(Vec2::new(ui.available_width(), 26.0)),
-                )
-                .clicked()
-            {
-                let _ = app.tx.send(Command::PrinterNow);
-            }
-            ui.horizontal(|ui| {
-                let half = ((ui.available_width() - 9.0) / 2.0).max(60.0);
-                if ui
-                    .add(Button::new("Заправить").min_size(Vec2::new(half, 26.0)))
-                    .clicked()
-                {
-                    let _ = app.tx.send(Command::PrinterRefillNow);
-                }
-                if ui
-                    .add(Button::new("Снять").min_size(Vec2::new(half, 26.0)))
-                    .clicked()
-                {
-                    let _ = app.tx.send(Command::PrinterWithdrawNow);
-                }
-            });
-        });
-    }
+        ))
+        .into_any_element()
+}

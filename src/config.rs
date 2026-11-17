@@ -60,7 +60,7 @@ pub struct Config {
     pub base_dir: PathBuf,
 }
 
-/// Параметры настоящего MTProto-прокси (например, TgWsProxy на 127.0.0.1:1443).
+/// Параметры настоящего MTProto-прокси (стандартный порт 8444).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MtProxyConfig {
     /// Адрес прокси.
@@ -78,6 +78,20 @@ pub struct MtProxyConfig {
     /// `off`/`none` — WSS-туннеля нет вовсе.
     #[serde(default)]
     pub worker: String,
+    /// Свой список доменов стандартного пула (`kws<dc>.<домен>`). Пусто —
+    /// зашитый список из Flowseal/tg-ws-proxy. Принимает и закодированный
+    /// вид апстрима (`xxx.com`), и готовый `.co.uk`.
+    #[serde(default)]
+    pub cf_domains: Vec<String>,
+    /// Сколько прогретых туннелей держать на один DC (0 — пул выключен).
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+    /// Сколько доменов пробовать одновременно, когда нужен новый туннель.
+    #[serde(default = "default_probe_parallel")]
+    pub probe_parallel: usize,
+    /// Сколько секунд живёт замер задержки домена (TTL счёта балансировщика).
+    #[serde(default = "default_score_ttl")]
+    pub score_ttl: u64,
 }
 
 fn default_mtp_host() -> String {
@@ -85,7 +99,19 @@ fn default_mtp_host() -> String {
 }
 
 fn default_mtp_port() -> u16 {
-    1443
+    8444
+}
+
+fn default_pool_size() -> usize {
+    2
+}
+
+fn default_probe_parallel() -> usize {
+    20
+}
+
+fn default_score_ttl() -> u64 {
+    600
 }
 
 impl Default for MtProxyConfig {
@@ -95,6 +121,10 @@ impl Default for MtProxyConfig {
             port: default_mtp_port(),
             secret: String::new(),
             worker: String::new(),
+            cf_domains: Vec::new(),
+            pool_size: default_pool_size(),
+            probe_parallel: default_probe_parallel(),
+            score_ttl: default_score_ttl(),
         }
     }
 }
@@ -538,7 +568,6 @@ impl Default for SafeConfig {
     }
 }
 
-
 /// Автоснятие дохода с бизнеса: команда «Бизнес снять» раз в час.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusinessConfig {
@@ -637,10 +666,7 @@ impl Config {
             .map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?;
         let mut cfg: Config =
             serde_json::from_str(&raw).map_err(|e| format!("ошибка в {}: {e}", path.display()))?;
-        cfg.base_dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+        cfg.base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         Ok(cfg)
     }
 }
