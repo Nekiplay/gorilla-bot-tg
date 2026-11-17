@@ -2505,7 +2505,7 @@ fn kws_packet(enc: &mut AesCtr256) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&[0u8; 8]);
     payload.extend_from_slice(&msg_id.to_le_bytes());
-    payload.extend_from_slice(&24u32.to_le_bytes());
+    payload.extend_from_slice(&20u32.to_le_bytes());
     payload.extend_from_slice(&0xbe7e_8ef1u32.to_le_bytes());
     payload.extend_from_slice(&[7u8; 16]);
     let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
@@ -2677,5 +2677,46 @@ mod dc_ws_tests {
         println!("расшифровано: {:02x?}", &raw[..raw.len().min(16)]);
         let len = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         assert!(len > 0 && len < 1_000_000, "плохая длина {len}");
+    }
+}
+
+
+#[cfg(test)]
+mod tgws_relay_tests {
+    /// Живой релей до локального TgWsProxy: настоящий сценарий — init, затем
+    /// `req_pq_multi` в intermediate-кадре (init объявляет тег `\xee\xee\xee\xee`).
+    /// `cargo test --bin gorilla-bot tgws_relay -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "живая сеть"]
+    async fn tgws_relay_echo() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1443".parse().expect("адрес");
+        let secret = super::parse_secret("e00a3136e590b94046bb639c875ec14a").expect("секрет");
+        let (init, mut enc, mut dec) = super::generate_client_handshake(&secret, 2);
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("TCP до TgWsProxy");
+        let _ = stream.set_nodelay(true);
+        println!("[tgws] порт {}", stream.local_addr().expect("порт"));
+        use aes::cipher::StreamCipher as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        stream.write_all(&init).await.expect("отправка init");
+
+        let frame = super::kws_packet(&mut enc);
+        println!("[tgws] кадр {} байт, заголовок {:02x?}", frame.len(), &frame[..4]);
+        stream.write_all(&frame).await.expect("отправка req_pq");
+
+        let mut buf = vec![0u8; 1024];
+        match tokio::time::timeout(std::time::Duration::from_secs(15), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => println!("[tgws] EOF — апстрим закрыл сессию"),
+            Ok(Ok(n)) => {
+                let mut body = buf[..n].to_vec();
+                dec.apply_keystream(&mut body);
+                println!(
+                    "[tgws] ответ {} байт, первые байты: {:02x?}",
+                    n,
+                    &body[..body.len().min(24)]
+                );
+            }
+            Ok(Err(e)) => println!("[tgws] ошибка чтения: {e}"),
+            Err(_) => println!("[tgws] МОЛЧИТ 15 c"),
+        }
     }
 }
