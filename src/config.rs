@@ -72,26 +72,6 @@ pub struct MtProxyConfig {
     /// Секрет (hex, с префиксом dd или без). Пусто — MTProto-мост выключен.
     #[serde(default)]
     pub secret: String,
-    /// Cloudflare-Worker (например, `name.workers.dev`). Если задан —
-    /// используется WSS-труба через него вместо obfuscated2-прокси.
-    /// Пусто — берутся стандартные CF-прокси из tg-ws-proxy;
-    /// `off`/`none` — WSS-туннеля нет вовсе.
-    #[serde(default)]
-    pub worker: String,
-    /// Свой список доменов стандартного пула (`kws<dc>.<домен>`). Пусто —
-    /// зашитый список из Flowseal/tg-ws-proxy. Принимает и закодированный
-    /// вид апстрима (`xxx.com`), и готовый `.co.uk`.
-    #[serde(default)]
-    pub cf_domains: Vec<String>,
-    /// Сколько прогретых туннелей держать на один DC (0 — пул выключен).
-    #[serde(default = "default_pool_size")]
-    pub pool_size: usize,
-    /// Сколько доменов пробовать одновременно, когда нужен новый туннель.
-    #[serde(default = "default_probe_parallel")]
-    pub probe_parallel: usize,
-    /// Сколько секунд живёт замер задержки домена (TTL счёта балансировщика).
-    #[serde(default = "default_score_ttl")]
-    pub score_ttl: u64,
     /// Плагин: адрес локального TgWsProxy (`127.0.0.1:1443`). Задан — бот
     /// поднимает свой SOCKS5 и ходит к Telegram через эту внешнюю программу.
     #[serde(default)]
@@ -115,18 +95,6 @@ fn default_mtp_port() -> u16 {
     8444
 }
 
-fn default_pool_size() -> usize {
-    2
-}
-
-fn default_probe_parallel() -> usize {
-    20
-}
-
-fn default_score_ttl() -> u64 {
-    600
-}
-
 pub fn default_tgws_port() -> u16 {
     1443
 }
@@ -137,54 +105,10 @@ impl Default for MtProxyConfig {
             host: default_mtp_host(),
             port: default_mtp_port(),
             secret: String::new(),
-            worker: String::new(),
-            cf_domains: Vec::new(),
-            pool_size: default_pool_size(),
-            probe_parallel: default_probe_parallel(),
-            score_ttl: default_score_ttl(),
             tgws: String::new(),
             tgws_secret: String::new(),
             tgws_local: true,
         }
-    }
-}
-
-/// Маршрут WSS-туннеля к DC Telegram (DPI его не видит: снаружи это TLS).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WsTunnel {
-    /// Свой Cloudflare-worker (`name.workers.dev`).
-    Worker(String),
-    /// Стандартные CF-прокси из tg-ws-proxy (`kws<dc>.<домен>`).
-    Defaults,
-}
-
-impl MtProxyConfig {
-    /// Свой воркер, если он задан (пусто/`off`/`none` — нет).
-    pub fn worker_domain(&self) -> Option<&str> {
-        let worker = self.worker.trim();
-        let disabled = worker.is_empty()
-            || worker == "-"
-            || worker.eq_ignore_ascii_case("off")
-            || worker.eq_ignore_ascii_case("none");
-        if disabled {
-            None
-        } else {
-            Some(worker)
-        }
-    }
-
-    /// Есть ли WSS-туннель и какой. Свой воркер > секрет MTProto-прокси >
-    /// стандартные CF-прокси tg-ws-proxy.
-    pub fn ws_tunnel(&self) -> Option<WsTunnel> {
-        if let Some(worker) = self.worker_domain() {
-            return Some(WsTunnel::Worker(worker.to_string()));
-        }
-        // Свой воркер явно выключен или есть локальный MTProto-прокси:
-        // стандартные CF-прокси не навязываем.
-        if !self.worker.trim().is_empty() || !self.secret.trim().is_empty() {
-            return None;
-        }
-        Some(WsTunnel::Defaults)
     }
 }
 

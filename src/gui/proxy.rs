@@ -1,4 +1,4 @@
-//! Прокси: SOCKS5, Cloudflare-воркер и локальный MTProxy.
+//! Прокси: SOCKS5, собственный MTProxy и локальный TgWsProxy.
 
 use super::{common, Bot};
 use gpui_kit::component::v_flex;
@@ -8,10 +8,11 @@ use gpui_kit::{AnyElement, Context, ParentElement, Styled, Window};
 /// Страница «Прокси».
 pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) -> AnyElement {
     let socks5 = bot.field("proxy", window, cx);
-    let worker = bot.field("mtproxy.worker", window, cx);
     let host = bot.field("mtproxy.host", window, cx);
     let port = bot.field("mtproxy.port", window, cx);
     let secret = bot.field("mtproxy.secret", window, cx);
+    let tgws = bot.field("mtproxy.tgws", window, cx);
+    let tgws_secret = bot.field("mtproxy.tgws_secret", window, cx);
 
     v_flex()
         .w_full()
@@ -33,11 +34,6 @@ pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) ->
                 ))
                 .child(common::field_row(
                     &*cx,
-                    "Worker",
-                    common::wide_input(&worker),
-                ))
-                .child(common::field_row(
-                    &*cx,
                     "MTProxy host",
                     common::wide_input(&host),
                 ))
@@ -51,9 +47,23 @@ pub(super) fn page(bot: &mut Bot, window: &mut Window, cx: &mut Context<Bot>) ->
                     "MTProxy secret",
                     common::wide_input(&secret),
                 ))
+                .child(common::field_row(
+                    &*cx,
+                    "TgWsProxy",
+                    common::wide_input(&tgws),
+                ))
+                .child(common::field_row(
+                    &*cx,
+                    "TgWsProxy secret",
+                    common::wide_input(&tgws_secret),
+                ))
                 .child(common::hint(
                     &*cx,
-                    "Воркер Cloudflare поднимает MTProxy рядом с ботом. Секрет — из вывода воркера.",
+                    "Пустой TgWsProxy — бот найдёт запущенный TgWsProxy сам (его config.json).",
+                ))
+                .child(common::hint(
+                    &*cx,
+                    "Секрет — из вывода MTProxy. Пустой host/port — прокси не используется.",
                 )),
         ))
         .into_any_element()

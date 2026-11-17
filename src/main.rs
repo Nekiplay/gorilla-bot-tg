@@ -11,7 +11,6 @@
 //! * `balance` — спросить у бота баланс и показать ответ;
 //! * `casino`  — автоигра в казино с удвоением ставки после проигрыша.
 
-mod balancer;
 
 mod captcha;
 mod casino;
@@ -30,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use casino::{Martingale, Outcome};
-use config::{CasinoConfig, Config, WsTunnel};
+use config::{CasinoConfig, Config};
 use grammers_client::client::UpdateStream;
 use grammers_client::message::Message;
 use grammers_client::peer::Peer;
@@ -197,23 +196,11 @@ impl Route {
     }
 }
 
-/// Маршрут подключения: свой воркер → MTProto-прокси по секрету →
-/// живой локальный прокси на `mtproxy.host:port` → внешний SOCKS5 → прямое.
-/// Стандартные CF-прокси (`kws*`, они часто лежат) берём только если
-/// локальный прокси задан, но не отвечает, — и говорим об этом вслух.
+/// Маршрут подключения: MTProto-прокси по секрету → живой локальный прокси
+/// на `mtproxy.host:port` → внешний SOCKS5 → локальный TgWsProxy → прямое.
 async fn resolve_route(cfg: &Config) -> Result<Route, BoxError> {
     let mt = &cfg.mtproxy;
-    mtproxy::configure(mt);
     let host = mt.host.trim();
-
-    if let Some(WsTunnel::Worker(worker)) = mt.ws_tunnel() {
-        // Cloudflare-worker: WSS-труба прямо к DC, DPI её не видит.
-        let local = mtproxy::spawn_worker_bridge(worker.clone()).await?;
-        return Ok(finish(Route::bridge(
-            local,
-            format!("свой Cloudflare-worker «{worker}»"),
-        )));
-    }
 
     if !mt.secret.trim().is_empty() {
         // Встроенный мост: локальный SOCKS5 → настоящий MTProto-прокси.
@@ -265,33 +252,15 @@ async fn resolve_route(cfg: &Config) -> Result<Route, BoxError> {
 
     if open_needs_secret {
         return Err(format!(
-            "{}; впиши секрет прокси в mtproxy.secret (или выключи прокси: mtproxy.worker = \"off\")",
+            "{}; впиши секрет прокси в mtproxy.secret (или выключи прокси: mtproxy.tgws = \"off\")",
             kind.describe(host, mt.port)
         )
         .into());
     }
 
-    // Воркер выключен явно (`off`/`none`/`-`): CF-прокси не навязываем.
-    if !mt.worker.trim().is_empty() {
-        let proxy = cfg.proxy.clone().filter(|p| !p.trim().is_empty());
-        let note = if proxy.is_some() {
-            format!(
-                "{}; беру socks-прокси из config.json",
-                kind.describe(host, mt.port)
-            )
-        } else {
-            format!("{}; иду напрямую", kind.describe(host, mt.port))
-        };
-        return Ok(finish(Route {
-            proxy,
-            note,
-            intermediate: false,
-        }));
-    }
-
-    // Ни локального прокси, ни плагина, ни воркера — честно говорим.
+    // Ни локального прокси, ни плагина — честно говорим.
     Err(format!(
-        "{}; локального прокси нет, плагин TgWsProxy не включён (mtproxy.tgws), своего воркера нет: запусти TgWsProxy (Flowseal/tg-ws-proxy) на 127.0.0.1:1443 или впиши туда свой адрес, либо укажи mtproxy.worker = \"<свой>.workers.dev\"",
+        "{}; плагин TgWsProxy не включён (mtproxy.tgws): запусти TgWsProxy (Flowseal/tg-ws-proxy) на 127.0.0.1:1443 или впиши его адрес в mtproxy.tgws",
         kind.describe(host, mt.port)
     )
     .into())
@@ -385,47 +354,9 @@ async fn probe_mode(cfg: &Config) -> Result<(), BoxError> {
 /// Проверка канала связи: поднимает мост/прокси из конфига и делает
 /// настоящий MTProto-обмен (генерация ключа авторизации) с DC2 —
 /// без входа и без отправки кода на телефон.
-/// Таблица балансировщика: DC → домен и задержка рукопожатия (счёт).
-fn print_balancer_table() {
-    let ttl = std::time::Duration::from_secs(mtproxy::score_ttl_secs());
-    let rows = match crate::balancer::global().lock() {
-        Ok(scores) => scores.rows(crate::balancer::now(), ttl),
-        Err(_) => Vec::new(),
-    };
-    println!("Балансировщик (DC → домен, счёт в секундах):");
-    for dc in [2i16, 4] {
-        let mut line = 0;
-        for (row_dc, domain, score, ok) in &rows {
-            if *row_dc != dc {
-                continue;
-            }
-            let mark = if *ok { "" } else { "  (отказ)" };
-            println!("  DC{dc:<3} {domain:<28} {score:>7.2}{mark}");
-            line += 1;
-        }
-        if line == 0 {
-            println!("  DC{dc:<3} — замеров нет после прогрева, домен выберется первым забегом");
-        }
-    }
-    for (dc, domain, score, ok) in &rows {
-        if *dc != 2 && *dc != 4 {
-            let mark = if *ok { "" } else { "  (отказ)" };
-            println!("  DC{dc:<3} {domain:<28} {score:>7.2}{mark}");
-        }
-    }
-}
-
-
 async fn check(cfg: &Config) -> Result<(), BoxError> {
     let route = resolve_route(cfg).await?;
     println!("Маршрут: {}", route.note);
-    // Счёт заполняется живыми рукопожатиями, поэтому перед таблицей делаем
-    // по одному забегу на DC — иначе она всегда пустая.
-    if !mtproxy::cf_domains().is_empty() {
-        println!("Прогрев балансировщика: замеряю домены…");
-        mtproxy::score_pool(&[2, 4]).await;
-    }
-    print_balancer_table();
     if route.proxy.is_none() {
         println!("Прямое подключение (прокси не настроен).");
     }
@@ -435,11 +366,7 @@ async fn check(cfg: &Config) -> Result<(), BoxError> {
     }
 
     // Main-адрес DC2: мост сначала пробует main-маршрут, потом медиа.
-    // Через worker — IP передаётся воркеру как dst (там он же и открывается).
-    let dc2: std::net::SocketAddr = match cfg.mtproxy.ws_tunnel() {
-        Some(WsTunnel::Worker(_)) => "149.154.167.51:443".parse().unwrap(),
-        _ => "149.154.167.50:443".parse().unwrap(),
-    };
+    let dc2: std::net::SocketAddr = "149.154.167.50:443".parse().unwrap();
     let addr = if proxy_url.is_empty() {
         ServerAddr::Tcp { address: dc2 }
     } else {

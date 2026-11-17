@@ -261,7 +261,8 @@ impl Bot {
             "mtproxy.host" => self.cfg.mtproxy.host.clone(),
             "mtproxy.port" => self.cfg.mtproxy.port.to_string(),
             "mtproxy.secret" => self.cfg.mtproxy.secret.clone(),
-            "mtproxy.worker" => self.cfg.mtproxy.worker.clone(),
+            "mtproxy.tgws" => self.cfg.mtproxy.tgws.clone(),
+            "mtproxy.tgws_secret" => self.cfg.mtproxy.tgws_secret.clone(),
             "casino.command" => self.cfg.casino.command.clone(),
             "casino.start_bet" => self.cfg.casino.start_bet.to_string(),
             "casino.max_bet" => self.cfg.casino.max_bet.to_string(),
@@ -341,7 +342,8 @@ impl Bot {
                 }
             }
             "mtproxy.secret" => self.cfg.mtproxy.secret = text.to_string(),
-            "mtproxy.worker" => self.cfg.mtproxy.worker = text.to_string(),
+            "mtproxy.tgws" => self.cfg.mtproxy.tgws = text.to_string(),
+            "mtproxy.tgws_secret" => self.cfg.mtproxy.tgws_secret = text.to_string(),
             "casino.command" => self.cfg.casino.command = text.to_string(),
             "casino.start_bet" => {
                 if let Some(v) = parse_u64(text) {
@@ -801,7 +803,8 @@ fn placeholder(key: &str) -> &'static str {
         "mtproxy.host" => "127.0.0.1",
         "mtproxy.port" => "8444",
         "mtproxy.secret" => "hex-секрет",
-        "mtproxy.worker" => "name.workers.dev",
+        "mtproxy.tgws" => "127.0.0.1:1443",
+        "mtproxy.tgws_secret" => "hex-секрет TgWsProxy",
         "casino.command" => "Казино {bet}",
         "safe.command" => "Сейф {code}",
         "pet.command" => "Питомец поход",
