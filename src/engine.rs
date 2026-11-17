@@ -137,7 +137,6 @@ pub enum Command {
     LoginCancel,
     /// Сохранить новые настройки в рантайме.
     SetConfig(Config),
-    Shutdown,
 }
 
 /// Общее состояние GUI и движка.
@@ -1555,10 +1554,6 @@ pub fn spawn(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
                         }
                         shared.log("[настройки] сохранены");
                     }
-                    Command::Shutdown => {
-                        stop_casino(&shared, "приложение закрыто");
-                        break;
-                    }
                 }
             }
         });
@@ -2075,39 +2070,17 @@ fn spawn_pet(shared: Arc<Shared>) {
             }
 
             match pet_once(&shared, &cfg).await {
-                Ok(PetTrip::Started { sent_id }) => {
-                    // В карточке питомца показываем, сколько ещё ждать возврата.
-                    shared.set_next_pet(now_unix() + PET_TRIP_WAIT as i64);
+                Ok(PetTrip::Started) => {
+                    // Сообщение о возврате приходит через часы, ждать его нельзя:
+                    // cледующий поход ставим сразу — через интервал из настроек.
+                    let now = now_unix();
+                    shared.set_last_pet(now);
+                    shared.reschedule_pet();
+                    let next = shared.next_pet_at().unwrap_or(now);
                     shared.log(format!(
-                        "[питомец] поход начат — жду сообщение о возврате (до {})",
-                        fmt_secs(PET_TRIP_WAIT as i64)
+                        "[питомец] поход начат — следующий через {}",
+                        fmt_secs((next - now).max(0))
                     ));
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(PET_TRIP_WAIT);
-                    match pet_wait_return(&shared, sent_id, deadline).await {
-                        Ok(Some(text)) => {
-                            let now = now_unix();
-                            shared.set_status(|s| s.last_bot_reply = one_line(&text));
-                            shared.log(format!("[питомец] поход завершён: {}", one_line(&text)));
-                            if let Some(sum) = credited_amount(&text) {
-                                shared.note_income(sum);
-                            }
-                            // Вернулся — следующий поход по интервалу из настроек
-                            // (interval_secs + разброс), как и раньше.
-                            shared.set_last_pet(now);
-                        }
-                        Ok(None) => {
-                            shared.log(format!(
-                                "[питомец] сообщения о возврате нет за {} — повторю поход",
-                                fmt_secs(PET_TRIP_WAIT as i64)
-                            ));
-                            shared.set_next_pet(now_unix() + PET_TRIP_MISSED as i64);
-                        }
-                        Err(e) => {
-                            shared.log(format!("[питомец] ожидание возврата: {e}"));
-                            shared.reset_chat().await;
-                            shared.set_next_pet(now_unix() + PET_TRIP_MISSED as i64);
-                        }
-                    }
                 }
                 Ok(PetTrip::Silent) => {}
                 Err(e) => {
@@ -2140,7 +2113,7 @@ pub(crate) fn pet_prep_command(reply: &str) -> Option<String> {
 
 /// Чем закончился поход: начался (бот ответил) или бот промолчал.
 enum PetTrip {
-    Started { sent_id: i32 },
+    Started,
     Silent,
 }
 
@@ -2149,7 +2122,6 @@ async fn pet_once(shared: &Shared, cfg: &Config) -> Result<PetTrip, BoxError> {
 
     let first =
         pet_send_confirmed(shared, &chat, &cfg.pet.command, cfg.pet.reply_timeout_secs).await?;
-    let sent_id = first.id;
     let mut reply = first.reply;
 
     // Бот перед походом может потребовать подготовку — то «питомец покормить»,
@@ -2172,9 +2144,18 @@ async fn pet_once(shared: &Shared, cfg: &Config) -> Result<PetTrip, BoxError> {
     }
 
     match reply {
-        // Бот ответил — поход начался. Таймер не двигаем: ждём сообщение
-        // «ваш питомец вернулся из похода, зачислено …», по нему и считаем.
-        Some(_) => Ok(PetTrip::Started { sent_id }),
+        // Бот ответил — поход начался. Срок следующего похода ставит вызывающий
+        // код: возврата не ждём, иначе следующий поход сдвигается на часы.
+        Some(text) => {
+            // Иногда бот отвечает сразу возвратом («вернулся из похода,
+            // зачислено …») — такое сообщение тоже засчитываем в доход.
+            if pet_is_return(&text) {
+                if let Some(sum) = credited_amount(&text) {
+                    shared.note_income(sum);
+                }
+            }
+            Ok(PetTrip::Started)
+        }
         // Бот промолчал: «последний поход» не двигаем, повторяем скоро —
         // иначе таймер уйдёт на полный интервал из-за потерянной команды.
         None => {
@@ -2195,44 +2176,6 @@ pub(crate) fn pet_is_return(text: &str) -> bool {
         || (lower.contains("питомец") && lower.contains("зачислено"))
 }
 
-/// Ждёт в чате сообщение о возврате питомца до `deadline`.
-/// `after_id` — id нашей команды похода: старые сообщения игнорируются.
-async fn pet_wait_return(
-    shared: &Shared,
-    sent_id: i32,
-    deadline: tokio::time::Instant,
-) -> Result<Option<String>, BoxError> {
-    let chat = shared.chat().await?;
-    let cancel = AtomicBool::new(false);
-    let mut since = sent_id;
-
-    loop {
-        let mut none: Option<UpdateStream> = None;
-        let waited = wait_reply(
-            &chat.client,
-            &mut none,
-            chat.bot_ref,
-            chat.bot_id,
-            since,
-            deadline,
-            &cancel,
-            true,
-        )
-        .await?;
-        match waited {
-            Wait::Reply(id, text) => {
-                since = id;
-                if pet_is_return(&text) {
-                    return Ok(Some(text));
-                }
-                // Прочие сообщения бота («питомец отправился в поход») — не возврат.
-                shared.set_status(|s| s.last_bot_reply = one_line(&text));
-                shared.log(format!("[питомец] {}", one_line(&text)));
-            }
-            Wait::Timeout | Wait::Cancelled => return Ok(None),
-        }
-    }
-}
 /// Сравниваем настройки таймера бонуса (для пересчёта срока).
 fn bonus_differs(a: &crate::config::BonusConfig, b: &crate::config::BonusConfig) -> bool {
     a.enabled != b.enabled
@@ -2595,21 +2538,19 @@ async fn pet_send(
     )
     .await;
 
-    let id = sent.id();
     match waited {
         Ok(Wait::Reply(_, text)) => {
             shared.set_status(|s| s.last_bot_reply = one_line(&text));
             shared.log(format!("[питомец] {}", one_line(&text)));
             Ok(PetSent {
-                id,
                 reply: Some(text),
             })
         }
         Ok(Wait::Timeout) => {
             shared.log("[питомец] ответ не пришёл за отведённое время");
-            Ok(PetSent { id, reply: None })
+            Ok(PetSent { reply: None })
         }
-        Ok(Wait::Cancelled) => Ok(PetSent { id, reply: None }),
+        Ok(Wait::Cancelled) => Ok(PetSent { reply: None }),
         Err(e) => {
             shared.log(format!("[питомец] {e}"));
             shared.reset_chat().await;
@@ -2617,10 +2558,8 @@ async fn pet_send(
         }
     }
 }
-/// Чем закончилась отправка команды питомцу. `id` — id нашего сообщения:
-/// сообщения о возврате ищем только новее него, чтобы не поймать прошлый поход.
+/// Чем закончилась отправка команды питомцу.
 struct PetSent {
-    id: i32,
     reply: Option<String>,
 }
 
@@ -2630,10 +2569,6 @@ const PET_ATTEMPTS: u32 = 3;
 const PET_RETRY_GAP: u64 = 25;
 /// Бот так и не ответил — повторяем скоро, а не через полный интервал.
 const PET_RETRY_SOON: u64 = 5 * 60;
-/// Сколько ждём сообщение «питомец вернулся из похода» после отправки.
-const PET_TRIP_WAIT: u64 = 3 * 60 * 60;
-/// Сообщения о возврате так и не было — пробуем поход снова через это время.
-const PET_TRIP_MISSED: u64 = 10 * 60;
 
 /// Шлёт команду питомцу, пока бот не ответит. `reply: None` — так и не ответил.
 async fn pet_send_confirmed(
