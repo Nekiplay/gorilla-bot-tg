@@ -894,23 +894,31 @@ async fn latch_upstream(
 ) -> Result<Latched, String> {
     const PENDING_CAP: usize = 256 * 1024;
     const FRAME_LEN_CAP: usize = 8 * 1024 * 1024;
-    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    // Живой сокет отвечает за доли секунды; 10 с молчания — это заведомо
+    // дохлое подключение (пул прокси выдаёт полумёртвые сокеты).
+    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
     const MAX_ATTEMPTS: u32 = 60;
 
-    let media_idx = if dc_idx > 0 { -dc_idx } else { dc_idx };
+    let _media_idx = if dc_idx > 0 { -dc_idx } else { dc_idx };
     let started = tokio::time::Instant::now();
     let overall = started + std::time::Duration::from_secs(120);
     // Сколько раз прокси принимал подключение, но не сказал ни байта:
     // если такое повторяется, дело в его собственном апстриме, а не в нас.
     let mut silent_rounds = 0u32;
+    // grammers (Intermediate) ставит служебный тег `ee ee ee ee` ПЕРЕД первым
+    // кадром, и ровно один раз. У обфусцированного потока этот тег живёт
+    // в рукопожатии (init[56..60]), поэтому из клиентского потока его надо
+    // вычистить: иначе MsgSplitter апстрима прочитает `0xEEEEEEEE & 0x7FFFFFFF`
+    // как длину кадра, не дождётся её и не отправит в WS ни байта.
+    let mut tag_stripped = false;
 
     for attempt in 1..=MAX_ATTEMPTS {
         if tokio::time::Instant::now() >= overall {
             break;
         }
-        // Чередуем маршруты: main, media, main, media… main важнее:
-        // медиа-кольцо может не отвечать на unauth req_pq, но труба живая.
-        let route_idx = if attempt % 2 == 0 { media_idx } else { dc_idx };
+        // Основное кольцо — всегда. Медиа (DC2m) наш собственный TgWsProxy
+        // на unauth req_pq не отвечает, поэтому в него не ходим вовсе.
+        let route_idx = dc_idx;
         let route_name = format!(
             "DC{}{}",
             route_idx.abs(),
@@ -953,8 +961,11 @@ async fn latch_upstream(
         // ответ выбрасывается как мусор.
         let attempt_deadline = tokio::time::Instant::now() + ATTEMPT_TIMEOUT;
         let mut up_plain: Vec<u8> = Vec::new();
-        let mut echo_skipped = 0usize;
+        // Некоторые маршруты Flowseal предваряют поток 64-байтовым эхом
+        // relay-init, наш собственный TgWsProxy — нет. Смещение первого кадра
+        // определяем по правдоподобной длине, а не по константе.
         let (mut latched, mut failed, mut client_gone) = (false, false, false);
+        let mut frame_offset: Option<usize> = None;
         let mut bad_frame = 0usize;
         let mut up_buf = [0u8; 16 * 1024];
         let mut cli_buf = [0u8; 16 * 1024];
@@ -966,25 +977,25 @@ async fn latch_upstream(
                     Ok(n) => {
                         let data = &mut up_buf[..n];
                         dec.apply_keystream(data);
-                        let plain = if echo_skipped < 64 {
-                            let take = std::cmp::min(64 - echo_skipped, n);
-                            echo_skipped += take;
-                            &data[take..]
-                        } else {
-                            data
-                        };
-                        up_plain.extend_from_slice(plain);
-                        if echo_skipped == 64 && !up_plain.is_empty() && up_plain.len() >= 4 {
-                            let flen = u32::from_le_bytes([
-                                up_plain[0], up_plain[1], up_plain[2], up_plain[3],
-                            ]) as usize;
-                            if flen == 0 || flen > FRAME_LEN_CAP {
-                                bad_frame = flen;
-                                failed = true;
-                            } else if up_plain.len() >= 4 + flen {
-                                // Первый полный кадр получен — фиксируемся.
-                                latched = true;
-                                break;
+                        up_plain.extend_from_slice(data);
+
+                        if frame_offset.is_none() {
+                            frame_offset = first_frame_offset(&up_plain, FRAME_LEN_CAP);
+                        }
+                        // Первый полный кадр получен — фиксируемся.
+                        if let Some(off) = frame_offset {
+                            let body = &up_plain[off..];
+                            if body.len() >= 4 {
+                                let flen = u32::from_le_bytes([
+                                    body[0], body[1], body[2], body[3],
+                                ]) as usize;
+                                if flen < 4 || flen > FRAME_LEN_CAP {
+                                    bad_frame = flen;
+                                    failed = true;
+                                } else if body.len() >= 4 + flen {
+                                    latched = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -997,6 +1008,7 @@ async fn latch_upstream(
                             return Err("слишком много байтов клиента до первого ответа апстрима".into());
                         }
                         pending.extend_from_slice(&cli_buf[..n]);
+                        strip_transport_tag(pending, &mut tag_stripped);
                     }
                     Err(_) => client_gone = true,
                 },
@@ -1021,28 +1033,26 @@ async fn latch_upstream(
                 upstream,
                 enc,
                 dec,
-                backlog: up_plain,
+                // Отдаём клиенту только настоящие кадры: возможное эхо
+                // relay-init (64 Б) у Flowseal клиенту не нужно.
+                backlog: up_plain[frame_offset.unwrap_or(0)..].to_vec(),
                 sent,
             });
         }
         let reason = if bad_frame != 0 {
             format!("мусорный кадр len={bad_frame}")
-        } else if echo_skipped < 64 {
-            if echo_skipped == 0 {
-                format!(
-                    "прокси молчит {:.0} c: подключение принято, но апстрим прокси не ответил",
-                    ATTEMPT_TIMEOUT.as_secs_f32()
-                )
-            } else {
-                format!("эхо {echo_skipped}/64")
-            }
         } else if up_plain.is_empty() {
-            "эхо есть, кадра нет".to_string()
+            format!(
+                "прокси молчит {:.0} c: подключение принято, но апстрим прокси не ответил",
+                ATTEMPT_TIMEOUT.as_secs_f32()
+            )
+        } else if frame_offset.is_none() {
+            format!("нет начала кадра в {} Б", up_plain.len())
         } else {
             format!("обрыв на {} Б кадра", up_plain.len())
         };
         println!("[мост] попытка {attempt} ({route_name}): апстрим «{reason}» — редайал");
-        if echo_skipped == 0 && bad_frame == 0 {
+        if frame_offset.is_none() && bad_frame == 0 {
             silent_rounds += 1;
         } else {
             silent_rounds = 0;
@@ -2494,6 +2504,42 @@ pub async fn probe_kws(dc: i16) -> bool {
     }
 }
 
+/// Убирает служебный тег транспорта `ee ee ee ee` из начала клиентского
+/// потока. Тег идёт первым и единственным (grammers `Intermediate::pack`
+/// выставляет `init` после первой вставки), поэтому достаточно одного раза;
+/// дальше в потоке идут обычные 4-байтовые длины кадров.
+fn strip_transport_tag(pending: &mut Vec<u8>, stripped: &mut bool) {
+    if *stripped || pending.len() < 4 {
+        return;
+    }
+    if pending[..4] == [0xee; 4] {
+        pending.drain(..4);
+    }
+    *stripped = true;
+}
+
+/// Ищет смещение первого правдоподобного intermediate-кадра в начале потока:
+/// длина кадра лежит в первых 4 байтах, лежит в пределах разумного, и сам
+/// кадр уже уместился. Так мы пропускаем возможное 64-байтовое эхо relay-init,
+/// не отрезая настоящие данные.
+fn first_frame_offset(stream: &[u8], cap: usize) -> Option<usize> {
+    let mut off = 0usize;
+    while off + 4 <= stream.len() && off <= 256 {
+        let len = u32::from_le_bytes([
+            stream[off],
+            stream[off + 1],
+            stream[off + 2],
+            stream[off + 3],
+        ]) as usize;
+        if len >= 4 && len <= cap && stream.len() >= off + 4 + len {
+            return Some(off);
+        }
+        off += 4;
+    }
+    None
+}
+
+
 /// Пакет `req_pq_multi` в intermediate-транспорте (без тега — его несёт init).
 fn kws_packet(enc: &mut AesCtr256) -> Vec<u8> {
     let msg_id = std::time::SystemTime::now()
@@ -2686,6 +2732,41 @@ mod tgws_relay_tests {
     /// Живой релей до локального TgWsProxy: настоящий сценарий — init, затем
     /// `req_pq_multi` в intermediate-кадре (init объявляет тег `\xee\xee\xee\xee`).
     /// `cargo test --bin gorilla-bot tgws_relay -- --ignored --nocapture`
+
+    /// Проверка гипотезы: апстрим ждёт служебный тег `\xee\xee\xee\xee`
+    /// перед первым пакетом (так его шлёт grammers напрямую).
+    #[tokio::test]
+    #[ignore = "живая сеть"]
+    async fn tgws_relay_preamble() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1443".parse().expect("адрес");
+        let secret = super::parse_secret("e00a3136e590b94046bb639c875ec14a").expect("секрет");
+        let (init, mut enc, mut dec) = super::generate_client_handshake(&secret, 2);
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("TCP до TgWsProxy");
+        let _ = stream.set_nodelay(true);
+        println!("[tgws] порт {}", stream.local_addr().expect("порт"));
+        use aes::cipher::StreamCipher as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        stream.write_all(&init).await.expect("отправка init");
+
+        let mut frame = vec![0xeeu8, 0xee, 0xee, 0xee];
+        frame.extend_from_slice(&super::kws_packet(&mut enc));
+        enc.apply_keystream(&mut frame);
+        println!("[tgws] кадр с тегом {} байт", frame.len());
+        stream.write_all(&frame).await.expect("отправка req_pq");
+
+        let mut buf = vec![0u8; 1024];
+        match tokio::time::timeout(std::time::Duration::from_secs(12), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => println!("[tgws] EOF — апстрим закрыл сессию"),
+            Ok(Ok(n)) => {
+                let mut body = buf[..n].to_vec();
+                dec.apply_keystream(&mut body);
+                println!("[tgws] ответ {} байт: {:02x?}", n, &body[..body.len().min(20)]);
+            }
+            Ok(Err(e)) => println!("[tgws] ошибка чтения: {e}"),
+            Err(_) => println!("[tgws] МОЛЧИТ 12 c"),
+        }
+    }
+
     #[tokio::test]
     #[ignore = "живая сеть"]
     async fn tgws_relay_echo() {
