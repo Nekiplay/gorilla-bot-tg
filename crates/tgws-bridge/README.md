@@ -7,6 +7,9 @@ TgWsProxy accepts MTProto clients on `127.0.0.1:1443` directly, but some clients
 speak a slightly different dialect than the one the proxy expects. This crate
 sits in between, fixes the stream and hands the client a plain
 `socks5://127.0.0.1:PORT` URL that every MTProto client understands.
+The source code of this library lives in the
+[gorilla-bot repository](https://github.com/Nekiplay/gorilla-bot-tg), under
+[`crates/tgws-bridge`](https://github.com/Nekiplay/gorilla-bot-tg/tree/main/crates/tgws-bridge).
 
 ```text
 MTProto client ──socks5──▶ tgws-bridge ──obfuscated2──▶ TgWsProxy ──TLS/WS──▶ Telegram DC

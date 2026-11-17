@@ -11,6 +11,9 @@
 //! replays the client's first frame once the upstream answers, and then relays
 //! both directions with the matching AES-CTR state.
 //!
+//! The source code lives in the [gorilla-bot repository]
+//! (<https://github.com/Nekiplay/gorilla-bot-tg>), under `crates/tgws-bridge`.
+//!
 //! ```no_run
 //! use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 //! use tgws_bridge::{Bridge, BridgeConfig, parse_secret};
