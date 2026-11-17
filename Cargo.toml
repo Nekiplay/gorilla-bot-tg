@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+tgws-bridge = { path = "crates/tgws-bridge" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
 grammers-client = { version = "0.12", features = ["proxy"] }
 grammers-session = "0.12"

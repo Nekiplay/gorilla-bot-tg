@@ -21,17 +21,15 @@ use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
 
 /// Открытый WSS-туннель (воркер или CF-прокси).
 type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
-
 
 /// Параметры пула из `config.json` (`mtproxy.pool_size` и соседи).
 static POOL_SIZE: AtomicUsize = AtomicUsize::new(2);
@@ -331,7 +329,7 @@ pub async fn cf_pool_probe() -> PoolProbe {
                 return PoolProbe {
                     live: Some(host),
                     reasons,
-                }
+                };
             }
             Ok(_) => {}
             Err(reason) => reasons.push(reason),
@@ -367,146 +365,17 @@ const RESERVED_STARTS: &[[u8; 4]] = &[
     [0x16, 0x03, 0x01, 0x02], // TLS ClientHello
 ];
 
-/// IPv4-адреса, которые grammers может запросить, → знаковый индекс DC
-/// (отрицательный — медиа-DC). Объединение встроенных адресов grammers
-/// (src/dc_options.rs) и карты из tg-ws-proxy-rs (src/inbound/socks.rs).
-const DC_IPS: &[(i16, Ipv4Addr)] = &[
-    (1, ipv4(149, 154, 175, 50)),
-    (1, ipv4(149, 154, 175, 51)),
-    (1, ipv4(149, 154, 175, 53)),
-    (1, ipv4(149, 154, 175, 54)),
-    (-1, ipv4(149, 154, 175, 52)),
-    (2, ipv4(149, 154, 167, 41)),
-    (2, ipv4(149, 154, 167, 50)),
-    (2, ipv4(149, 154, 167, 51)),
-    (2, ipv4(149, 154, 167, 220)),
-    (2, ipv4(95, 161, 76, 100)),
-    (-2, ipv4(149, 154, 167, 151)),
-    (-2, ipv4(149, 154, 167, 222)),
-    (-2, ipv4(149, 154, 167, 223)),
-    (-2, ipv4(149, 154, 162, 123)),
-    (3, ipv4(149, 154, 175, 100)),
-    (3, ipv4(149, 154, 175, 101)),
-    (-3, ipv4(149, 154, 175, 102)),
-    (4, ipv4(149, 154, 167, 91)),
-    (4, ipv4(149, 154, 167, 92)),
-    (-4, ipv4(149, 154, 164, 250)),
-    (-4, ipv4(149, 154, 166, 120)),
-    (-4, ipv4(149, 154, 166, 121)),
-    (-4, ipv4(149, 154, 167, 118)),
-    (-4, ipv4(149, 154, 165, 111)),
-    (-4, ipv4(149, 154, 165, 136)),
-    (5, ipv4(91, 108, 56, 100)),
-    (5, ipv4(91, 108, 56, 101)),
-    (5, ipv4(91, 108, 56, 104)),
-    (5, ipv4(91, 108, 56, 116)),
-    (5, ipv4(91, 108, 56, 126)),
-    (5, ipv4(149, 154, 171, 5)),
-    (-5, ipv4(91, 108, 56, 102)),
-    (-5, ipv4(91, 108, 56, 128)),
-    (-5, ipv4(91, 108, 56, 147)),
-    (-5, ipv4(91, 108, 56, 151)),
-];
-
 const fn ipv4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
     Ipv4Addr::new(a, b, c, d)
 }
 
-/// Настоящий MTProto-прокси, к которому мост пробивается.
-#[derive(Clone)]
-struct Target {
-    addr: SocketAddr,
-    secret: Arc<[u8; 16]>,
-}
-
 /// Разбор секрета: «dd<32hex>» или чистые 32 hex-символа.
 pub fn parse_secret(raw: &str) -> Result<[u8; 16], String> {
-    let raw = raw.trim();
-    let hex = if raw.len() == 34 && (raw.starts_with("dd") || raw.starts_with("ee")) {
-        &raw[2..]
-    } else {
-        raw
-    };
-    let bytes: Result<Vec<u8>, _> = (0..16)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
-        .collect();
-    let bytes = bytes.map_err(|_| format!("не удалось разобрать секрет «{raw}»"))?;
-    bytes
-        .try_into()
-        .map_err(|_| "секрет должен быть 16 байт".into())
+    tgws_bridge::parse_secret(raw).map_err(|e| e.to_string())
 }
 
 fn make_cipher(key: &[u8], iv: &[u8]) -> AesCtr256 {
     AesCtr256::new_from_slices(key, iv).expect("ключ 32 байта и IV 16 байт")
-}
-
-/// Генерация 64-байтового обфусцированного рукопожатия для вышестоящего
-/// MTProto-прокси плюс два шифра сессии (отправка/приём).
-/// Перенесено с адаптацией из tg-ws-proxy-rs/src/crypto.rs (MIT).
-fn generate_client_handshake(
-    secret: &[u8; 16],
-    dc_idx: i16,
-) -> ([u8; HANDSHAKE_LEN], AesCtr256, AesCtr256) {
-    let dc_bytes = dc_idx.to_le_bytes();
-
-    loop {
-        let mut raw = [0u8; HANDSHAKE_LEN];
-        rand::rng().fill_bytes(&mut raw);
-
-        if RESERVED_FIRST_BYTES.contains(&raw[0]) {
-            continue;
-        }
-        if RESERVED_STARTS.iter().any(|s| *s == raw[..4]) {
-            continue;
-        }
-        if raw[4..8] == [0; 4] {
-            continue;
-        }
-
-        // Ключ выводится из «сырых» байтов [8..56] и секрета.
-        let mut key = Sha256::new();
-        key.update(&raw[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
-        key.update(secret);
-        let key: [u8; 32] = key.finalize().into();
-        let iv = &raw[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
-
-        // Полный keystream (шифрование нулей).
-        let mut keystream = [0u8; HANDSHAKE_LEN];
-        make_cipher(&key, iv).apply_keystream(&mut keystream);
-
-        let mut handshake = raw;
-        for i in 0..4 {
-            handshake[PROTO_TAG_POS + i] = PROTO_TAG_INTERMEDIATE[i] ^ keystream[PROTO_TAG_POS + i];
-        }
-        for i in 0..2 {
-            handshake[DC_IDX_POS + i] = dc_bytes[i] ^ keystream[DC_IDX_POS + i];
-        }
-        // handshake[62..64] — случайные, прокси их не трактует.
-
-        // Шифр отправки: те же ключ и IV, промотанные на 64 байта рукопожатия.
-        let mut enc_key = Sha256::new();
-        enc_key.update(&handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
-        enc_key.update(secret);
-        let enc_key: [u8; 32] = enc_key.finalize().into();
-        let mut enc = make_cipher(
-            &enc_key,
-            &handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN],
-        );
-        let mut dummy = [0u8; HANDSHAKE_LEN];
-        enc.apply_keystream(&mut dummy);
-
-        // Шифр приёма: перевёрнутые prekey+IV, без промотки.
-        let mut reversed = [0u8; PREKEY_LEN + IV_LEN];
-        reversed.copy_from_slice(&handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]);
-        reversed.reverse();
-        let mut dec_key = Sha256::new();
-        dec_key.update(&reversed[..PREKEY_LEN]);
-        dec_key.update(secret);
-        let dec_key: [u8; 32] = dec_key.finalize().into();
-        let dec = make_cipher(&dec_key, &reversed[PREKEY_LEN..]);
-
-        return (handshake, enc, dec);
-    }
 }
 
 /// Транспорт MTProto, которым клиент общается с DC.
@@ -578,7 +447,9 @@ impl LocalKind {
     /// Человеческое описание для лога и `--check`.
     pub fn describe(self, host: &str, port: u16) -> String {
         match self {
-            Self::Socks5 => format!("{host}:{port} отвечает как SOCKS5 — ходим через него напрямую"),
+            Self::Socks5 => {
+                format!("{host}:{port} отвечает как SOCKS5 — ходим через него напрямую")
+            }
             Self::Open => format!(
                 "{host}:{port} открыт, но SOCKS5 не отвечает: это MTProto-прокси, ему нужен mtproxy.secret"
             ),
@@ -587,17 +458,13 @@ impl LocalKind {
     }
 }
 
-/// Последняя причина, по которой мост не смог получить живой ответ.
-static LAST_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Живые мосты: `tgws_bridge::Bridge` останавливается на `Drop`, поэтому
+/// каждый поднятый мост живёт здесь до конца процесса.
+static BRIDGES: std::sync::Mutex<Vec<tgws_bridge::Bridge>> = std::sync::Mutex::new(Vec::new());
 
 pub fn last_reason() -> Option<String> {
-    LAST_REASON.lock().ok().and_then(|slot| slot.clone())
-}
-
-fn remember_reason(text: String) {
-    if let Ok(mut slot) = LAST_REASON.lock() {
-        *slot = Some(text);
-    }
+    let bridges = BRIDGES.lock().ok()?;
+    bridges.iter().rev().find_map(|bridge| bridge.last_reason())
 }
 
 /// Настройки локального TgWsProxy (Flowseal/tg-ws-proxy): адрес, порт и
@@ -605,24 +472,8 @@ fn remember_reason(text: String) {
 /// Нужно, чтобы бот подключался к уже запущенному прокси, даже если в
 /// `config.json` бота `mtproxy.tgws` пуст и порт отличается от стандартного.
 pub fn tgws_local() -> Option<(String, u16, [u8; 16])> {
-    let base = std::env::var_os("APPDATA")?;
-    let path = std::path::PathBuf::from(base)
-        .join("TgWsProxy")
-        .join("config.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let host = value
-        .get("host")
-        .and_then(|host| host.as_str())
-        .unwrap_or("127.0.0.1")
-        .to_string();
-    let port = value
-        .get("port")
-        .and_then(|port| port.as_u64())
-        .and_then(|port| u16::try_from(port).ok())
-        .unwrap_or_else(crate::config::default_tgws_port);
-    let secret = parse_secret(value.get("secret")?.as_str()?).ok()?;
-    Some((host, port, secret))
+    let proxy = tgws_bridge::autodetect()?;
+    Some((proxy.host, proxy.port, proxy.secret?))
 }
 
 /// Адрес локального TgWsProxy из настроек бота (`mtproxy.tgws`), иначе —
@@ -700,34 +551,9 @@ pub async fn probe_local(host: &str, port: u16) -> LocalKind {
 /// Мгновенный EOF — режим/секрет не приняты (Close); долгое молчание —
 /// неверный секрет (Drain: прокси вычитывает мусор, не отвечая).
 pub async fn probe(target: SocketAddr, secret: [u8; 16]) -> String {
-    let (init, _enc, _dec) = generate_client_handshake(&secret, 2);
-
-    let mut stream = match TcpStream::connect(target).await {
-        Ok(s) => s,
-        Err(e) => return format!("не удалось подключиться к {target}: {e}"),
-    };
-    let start = tokio::time::Instant::now();
-    if let Err(e) = stream.write_all(&init).await {
-        return format!("не удалось отправить рукопожатие: {e}");
-    }
-
-    let mut buf = [0u8; 512];
-    tokio::select! {
-        r = stream.read(&mut buf) => match r {
-            Ok(0) => format!(
-                "EOF через {:?} — прокси ПРИНЯЛ подключение и закрыл его (Close, вероятно проблема выше по цепочке)",
-                start.elapsed()
-            ),
-            Ok(n) => format!(
-                "ОТВЕТ: {n} байт через {:?} — прокси жив и отвечает (секрет верен)",
-                start.elapsed()
-            ),
-            Err(e) => format!("ошибка чтения через {:?}: {e}", start.elapsed()),
-        },
-        _ = tokio::time::sleep(std::time::Duration::from_secs(12)) => {
-            "МОЛЧИТ >12 c (Drain) — секрет неверен: прокси вычитывает мусор, не отвечая".to_string()
-        }
-    }
+    tgws_bridge::probe(target, secret)
+        .await
+        .unwrap_or_else(|e| format!("проба {target} не удалась: {e}"))
 }
 
 /// Запускает локальный SOCKS5-мост и возвращает его адрес (`socks5://...`).
@@ -735,50 +561,20 @@ pub async fn spawn_socks_bridge(
     target_addr: SocketAddr,
     secret: [u8; 16],
 ) -> Result<SocketAddr, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("не удалось занять локальный порт под мост: {e}"))?;
-    let local = listener
-        .local_addr()
-        .map_err(|e| format!("адрес моста: {e}"))?;
-
-    let target = Arc::new(Target {
-        addr: target_addr,
-        secret: Arc::new(secret),
-    });
-
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nodelay(true);
-                    let target = Arc::clone(&target);
-                    tokio::spawn(async move {
-                        if let Err(e) = serve_client(stream, &target).await {
-                            eprintln!("[мост] соединение закрыто: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    eprintln!("[мост] приём подключений: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        }
-    });
-
-    println!("[мост] локальный SOCKS5: {local} → MTProto {target_addr}");
+    let bridge = tgws_bridge::Bridge::spawn(
+        tgws_bridge::BridgeConfig::new(target_addr, secret).with_log(|line| eprintln!("{line}")),
+    )
+    .await
+    .map_err(|e| format!("не удалось поднять мост к {target_addr}: {e}"))?;
+    let local = bridge.local_addr();
+    if let Ok(mut bridges) = BRIDGES.lock() {
+        bridges.push(bridge);
+    }
     Ok(local)
 }
 
 fn dc_by_ip(ip: IpAddr) -> Option<i16> {
-    match ip {
-        IpAddr::V4(v4) => DC_IPS
-            .iter()
-            .find(|(_, known)| *known == v4)
-            .map(|(dc, _)| *dc),
-        IpAddr::V6(_) => None,
-    }
+    tgws_bridge::dc_for_ip(ip)
 }
 
 async fn socks_reply(stream: &mut TcpStream, code: u8) -> Result<(), String> {
@@ -867,225 +663,6 @@ async fn socks_accept(client: &mut TcpStream) -> Result<(IpAddr, i16), String> {
 
     socks_reply(client, 0).await?;
     Ok((dst_ip, dc_idx))
-}
-
-/// Результат успешной «фиксации» на живом сокете прокси.
-struct Latched {
-    upstream: TcpStream,
-    enc: AesCtr256,
-    dec: AesCtr256,
-    /// Расшифрованные байты апстрима: не меньше первого полного кадра.
-    backlog: Vec<u8>,
-    /// Сколько байт из `pending` уже ушло в этот апстрим.
-    sent: usize,
-}
-
-/// Живучий подбор апстрима. Пул прокси выдаёт наполовину мёртвые сокеты
-/// (DPI рвёт апстрим, а локально сокет выглядит живым: _is_stale у Flowseal
-/// проверяет только локальное состояние), поэтому до первого ПОЛНОГО кадра
-/// ответа делаем редайал с реплеем: клиентские байты копятся в `pending`,
-/// каждый новый сокет получает их заново (req_pq/DH stateless со стороны
-/// сервера). Живой сокет отвечает за доли секунды, таймаут попытки 4 с.
-async fn latch_upstream(
-    client: &mut TcpStream,
-    target: &Target,
-    dc_idx: i16,
-    pending: &mut Vec<u8>,
-) -> Result<Latched, String> {
-    const PENDING_CAP: usize = 256 * 1024;
-    const FRAME_LEN_CAP: usize = 8 * 1024 * 1024;
-    // Живой сокет отвечает за доли секунды; 10 с молчания — это заведомо
-    // дохлое подключение (пул прокси выдаёт полумёртвые сокеты).
-    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
-    const MAX_ATTEMPTS: u32 = 60;
-
-    let _media_idx = if dc_idx > 0 { -dc_idx } else { dc_idx };
-    let started = tokio::time::Instant::now();
-    let overall = started + std::time::Duration::from_secs(120);
-    // Сколько раз прокси принимал подключение, но не сказал ни байта:
-    // если такое повторяется, дело в его собственном апстриме, а не в нас.
-    let mut silent_rounds = 0u32;
-    // grammers (Intermediate) ставит служебный тег `ee ee ee ee` ПЕРЕД первым
-    // кадром, и ровно один раз. У обфусцированного потока этот тег живёт
-    // в рукопожатии (init[56..60]), поэтому из клиентского потока его надо
-    // вычистить: иначе MsgSplitter апстрима прочитает `0xEEEEEEEE & 0x7FFFFFFF`
-    // как длину кадра, не дождётся её и не отправит в WS ни байта.
-    let mut tag_stripped = false;
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        if tokio::time::Instant::now() >= overall {
-            break;
-        }
-        // Основное кольцо — всегда. Медиа (DC2m) наш собственный TgWsProxy
-        // на unauth req_pq не отвечает, поэтому в него не ходим вовсе.
-        let route_idx = dc_idx;
-        let route_name = format!(
-            "DC{}{}",
-            route_idx.abs(),
-            if route_idx < 0 { " media" } else { "" }
-        );
-
-        let mut upstream = match TcpStream::connect(target.addr).await {
-            Ok(s) => {
-                // Мелкие MTProto-пакеты: без этого Nagle даёт +40 мс на обмен.
-                let _ = s.set_nodelay(true);
-                s
-            }
-            Err(e) => {
-                println!("[мост] попытка {attempt}: прокси недоступен ({e}), пауза");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        let (init, mut enc, mut dec) = generate_client_handshake(&target.secret, route_idx);
-        if let Err(e) = upstream.write_all(&init).await {
-            println!("[мост] попытка {attempt} ({route_name}): рукопожатие не ушло ({e})");
-            continue;
-        }
-        let mut sent = 0usize;
-        if !pending.is_empty() {
-            let mut blob = pending.clone();
-            enc.apply_keystream(&mut blob);
-            if let Err(e) = upstream.write_all(&blob).await {
-                println!("[мост] попытка {attempt} ({route_name}): реплей не ушёл ({e})");
-                continue;
-            }
-            sent = pending.len();
-        }
-
-        // Гонка: первый кадр апстрима / новые байты клиента / таймаут попытки.
-        // ВСЕ маршруты Flowseal (pool/CF/worker/TCP) начинают поток клиента
-        // 64-байтовым эхом relay-init (их bridge_ws_reencrypt не вычитает его),
-        // и только потом идут кадры MTProto. Эхо обязано быть пропущено,
-        // иначе первые 4 байта случайности читаются как «длина кадра» и живой
-        // ответ выбрасывается как мусор.
-        let attempt_deadline = tokio::time::Instant::now() + ATTEMPT_TIMEOUT;
-        let mut up_plain: Vec<u8> = Vec::new();
-        // Некоторые маршруты Flowseal предваряют поток 64-байтовым эхом
-        // relay-init, наш собственный TgWsProxy — нет. Смещение первого кадра
-        // определяем по правдоподобной длине, а не по константе.
-        let (mut latched, mut failed, mut client_gone) = (false, false, false);
-        let mut frame_offset: Option<usize> = None;
-        let mut bad_frame = 0usize;
-        let mut up_buf = [0u8; 16 * 1024];
-        let mut cli_buf = [0u8; 16 * 1024];
-        loop {
-            tokio::select! {
-                biased;
-                r = upstream.read(&mut up_buf) => match r {
-                    Ok(0) => failed = true,
-                    Ok(n) => {
-                        let data = &mut up_buf[..n];
-                        dec.apply_keystream(data);
-                        up_plain.extend_from_slice(data);
-
-                        if frame_offset.is_none() {
-                            frame_offset = first_frame_offset(&up_plain, FRAME_LEN_CAP);
-                        }
-                        // Первый полный кадр получен — фиксируемся.
-                        if let Some(off) = frame_offset {
-                            let body = &up_plain[off..];
-                            if body.len() >= 4 {
-                                let flen = u32::from_le_bytes([
-                                    body[0], body[1], body[2], body[3],
-                                ]) as usize;
-                                if flen < 4 || flen > FRAME_LEN_CAP {
-                                    bad_frame = flen;
-                                    failed = true;
-                                } else if body.len() >= 4 + flen {
-                                    latched = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => failed = true,
-                },
-                r = client.read(&mut cli_buf) => match r {
-                    Ok(0) => client_gone = true,
-                    Ok(n) => {
-                        if pending.len() + n > PENDING_CAP {
-                            return Err("слишком много байтов клиента до первого ответа апстрима".into());
-                        }
-                        pending.extend_from_slice(&cli_buf[..n]);
-                        strip_transport_tag(pending, &mut tag_stripped);
-                    }
-                    Err(_) => client_gone = true,
-                },
-                _ = tokio::time::sleep_until(attempt_deadline) => failed = true,
-            }
-            if latched || failed || client_gone {
-                break;
-            }
-        }
-
-        if client_gone {
-            let _ = upstream.shutdown().await;
-            return Err("клиент закрыл соединение до ответа апстрима".into());
-        }
-        if latched {
-            println!(
-                "[мост] ЖИВОЙ сокет: попытка {attempt} ({route_name}), первый кадр {} Б ({:.1} c от старта)",
-                up_plain.len(),
-                started.elapsed().as_secs_f32()
-            );
-            return Ok(Latched {
-                upstream,
-                enc,
-                dec,
-                // Отдаём клиенту только настоящие кадры: возможное эхо
-                // relay-init (64 Б) у Flowseal клиенту не нужно.
-                backlog: up_plain[frame_offset.unwrap_or(0)..].to_vec(),
-                sent,
-            });
-        }
-        let reason = if bad_frame != 0 {
-            format!("мусорный кадр len={bad_frame}")
-        } else if up_plain.is_empty() {
-            format!(
-                "прокси молчит {:.0} c: подключение принято, но апстрим прокси не ответил",
-                ATTEMPT_TIMEOUT.as_secs_f32()
-            )
-        } else if frame_offset.is_none() {
-            format!("нет начала кадра в {} Б", up_plain.len())
-        } else {
-            format!("обрыв на {} Б кадра", up_plain.len())
-        };
-        println!("[мост] попытка {attempt} ({route_name}): апстрим «{reason}» — редайал");
-        if frame_offset.is_none() && bad_frame == 0 {
-            silent_rounds += 1;
-        } else {
-            silent_rounds = 0;
-        }
-        let _ = upstream.shutdown().await;
-        // Не_DDoSим прокси и CF: сначала быстро ловим окно, дальше всё реже.
-        let gap = if attempt < 5 {
-            std::time::Duration::from_secs(1)
-        } else if attempt < 15 {
-            std::time::Duration::from_secs(10)
-        } else {
-            std::time::Duration::from_secs(20)
-        };
-        tokio::time::sleep(gap).await;
-        if silent_rounds >= 3 {
-            break;
-        }
-    }
-
-    let verdict = if silent_rounds >= 3 {
-        format!(
-            "прокси {target_addr} принимает подключение, но {silent_rounds} раза подряд молчал по {:.0} c — не отвечает его собственный апстрим; проверь лог TgWsProxy (proxy.log)",
-            ATTEMPT_TIMEOUT.as_secs_f32(),
-            target_addr = target.addr,
-        )
-    } else {
-        format!(
-            "ни один сокет прокси не отдал живой ответ за {:.0} c — канал мёртв",
-            started.elapsed().as_secs()
-        )
-    };
-    remember_reason(verdict.clone());
-    Err(verdict)
 }
 
 /// Полный цикл одного клиента: SOCKS5-переговоры → obfuscated2-рукопожатие
@@ -1201,12 +778,7 @@ async fn connect_ws_once(
 
     let (ws, response) = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        tokio_tungstenite::client_async_tls_with_config(
-            request,
-            tcp,
-            None,
-            Some(connector),
-        ),
+        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, Some(connector)),
     )
     .await
     .map_err(|_| timeout_msg.to_string())?
@@ -1575,10 +1147,13 @@ async fn tls_upstream(ip: &str) -> Result<tokio_rustls::client::TlsStream<TcpStr
     let name = tls_domain();
     let server_name = rustls::pki_types::ServerName::try_from(name.to_string())
         .map_err(|e| format!("TLS: имя {name}: {e}"))?;
-    tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, stream))
-        .await
-        .map_err(|_| "TLS: таймаут рукопожатия".to_string())?
-        .map_err(|e| format!("TLS: рукопожатие: {e}"))
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| "TLS: таймаут рукопожатия".to_string())?
+    .map_err(|e| format!("TLS: рукопожатие: {e}"))
 }
 
 /// Проверялка сертификата «принимаем любой».
@@ -1629,7 +1204,6 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
-
 
 /// Свежее подключение к воркеру через тот же рукопожатный конвейер.
 async fn dial_worker(dc: i16, dst: IpAddr, worker: &str) -> Result<WsStream, String> {
@@ -1906,7 +1480,8 @@ impl CfProxyPool {
             let url = format!("wss://{host}/apiws");
             eprintln!("[cf-прокси] DC{dc}: пробую лучший по счёту {best}");
             let started = Instant::now();
-            match connect_ws(&url, &format!("таймаут WSS-подключения к {host}")).await {
+            match connect_ws(&url, &format!("таймаут WSS-подключения к {host}")).await
+            {
                 Ok(ws) => {
                     let elapsed = started.elapsed();
                     record_score(dc, &best, Some(elapsed));
@@ -2116,9 +1691,9 @@ async fn serve_dc_client(mut client: TcpStream) -> Result<(), String> {
     let pause = {
         let map = tcp_backoff().lock().await;
         match map.get(&dc) {
-            Some((failures, until)) if Instant::now() < *until => {
-                Some(format!("DC{dc}: прямой TCP на паузе после {failures} отказов"))
-            }
+            Some((failures, until)) if Instant::now() < *until => Some(format!(
+                "DC{dc}: прямой TCP на паузе после {failures} отказов"
+            )),
             _ => None,
         }
     };
@@ -2130,7 +1705,9 @@ async fn serve_dc_client(mut client: TcpStream) -> Result<(), String> {
     let transport = dc_probe(dc).await;
     if transport.is_none() {
         record_tcp_failure(dc).await;
-        return Err(format!("DC{dc}: не отвечает ни по TLS, ни обфусцированным TCP"));
+        return Err(format!(
+            "DC{dc}: не отвечает ни по TLS, ни обфусцированным TCP"
+        ));
     }
     tcp_backoff().lock().await.remove(&dc);
 
@@ -2144,11 +1721,13 @@ async fn serve_dc_client(mut client: TcpStream) -> Result<(), String> {
             relay(client, upstream, enc, dec).await
         }
         _ => {
-            let mut upstream =
-                tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((ip.as_str(), 443)))
-                    .await
-                    .map_err(|_| format!("DC{dc}: таймаут TCP {ip}:443"))?
-                    .map_err(|e| format!("DC{dc}: TCP {ip}:443: {e}"))?;
+            let mut upstream = tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpStream::connect((ip.as_str(), 443)),
+            )
+            .await
+            .map_err(|_| format!("DC{dc}: таймаут TCP {ip}:443"))?
+            .map_err(|e| format!("DC{dc}: TCP {ip}:443: {e}"))?;
             let _ = upstream.set_nodelay(true);
             upstream
                 .write_all(&init)
@@ -2164,8 +1743,8 @@ async fn record_tcp_failure(dc: i16) {
     let mut map = tcp_backoff().lock().await;
     let entry = map.entry(dc).or_insert((0, Instant::now()));
     entry.0 += 1;
-    let delay = (TCP_BACKOFF_INITIAL * 2f64.powi(entry.0.saturating_sub(1) as i32))
-        .min(TCP_BACKOFF_MAX);
+    let delay =
+        (TCP_BACKOFF_INITIAL * 2f64.powi(entry.0.saturating_sub(1) as i32)).min(TCP_BACKOFF_MAX);
     entry.1 = Instant::now() + Duration::from_secs_f64(delay);
 }
 
@@ -2180,37 +1759,13 @@ async fn serve_cfproxy_client(mut client: TcpStream) -> Result<(), String> {
     pump(client, ws, enc, dec, Proto::Intermediate, "cf-прокси").await
 }
 
-async fn serve_client(mut client: TcpStream, target: &Target) -> Result<(), String> {
-    let (_, dc_idx) = socks_accept(&mut client).await?;
-
-    // --- obfuscated2 к настоящему прокси, с редайалом до живого сокета ---
-    let mut pending: Vec<u8> = Vec::new();
-    let mut latched = latch_upstream(&mut client, target, dc_idx, &mut pending).await?;
-
-    // Отдать клиенту уже расшифрованный первый кадр (и всё, что пришло с ним).
-    client
-        .write_all(&latched.backlog)
-        .await
-        .map_err(|e| format!("первый кадр клиенту: {e}"))?;
-    // Дослать клиентские байты, накопившиеся ПОСЛЕ реплея на живой сокет.
-    if pending.len() > latched.sent {
-        let delta = &pending[latched.sent..];
-        let mut blob = delta.to_vec();
-        latched.enc.apply_keystream(&mut blob);
-        latched
-            .upstream
-            .write_all(&blob)
-            .await
-            .map_err(|e| format!("досыл клиентских байтов: {e}"))?;
-    }
-    let Latched {
-        upstream, enc, dec, ..
-    } = latched;
-    relay(client, upstream, enc, dec).await
-}
-
 /// Двунаправленная пересылка с AES-CTR поверх обоих направлений.
-async fn relay<U>(mut client: TcpStream, upstream: U, enc: AesCtr256, dec: AesCtr256) -> Result<(), String>
+async fn relay<U>(
+    mut client: TcpStream,
+    upstream: U,
+    enc: AesCtr256,
+    dec: AesCtr256,
+) -> Result<(), String>
 where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
@@ -2267,7 +1822,7 @@ where
 
 #[cfg(test)]
 mod local_probe_tests {
-    use super::{probe_local, LocalKind};
+    use super::{LocalKind, probe_local};
 
     /// Стандартный пул — 20 доменов; забег должен покрывать его целиком,
     /// иначе время до ошибки растёт кратно числу пачек по 6 секунд.
@@ -2281,7 +1836,11 @@ mod local_probe_tests {
     #[test]
     fn plan_takes_scored_leader_first() {
         super::record_score(91, "kws2.fast", Some(std::time::Duration::from_millis(150)));
-        super::record_score(91, "kws2.slow", Some(std::time::Duration::from_millis(1500)));
+        super::record_score(
+            91,
+            "kws2.slow",
+            Some(std::time::Duration::from_millis(1500)),
+        );
         let order = vec!["kws2.slow".to_string(), "kws2.fast".to_string()];
         let (leader, rest) = super::attempt_plan(91, order);
         assert_eq!(leader.as_deref(), Some("kws2.fast"));
@@ -2358,7 +1917,10 @@ mod dc_direct_tests {
             server.clone(),
         )
         .await;
-        println!("plain intermediate: {}", plain.as_ref().map(|_| "ok").unwrap_or("fail"));
+        println!(
+            "plain intermediate: {}",
+            plain.as_ref().map(|_| "ok").unwrap_or("fail")
+        );
         let obf = grammers_mtsender::connect(
             grammers_mtproto::transport::Obfuscated::new(
                 grammers_mtproto::transport::Intermediate::new(),
@@ -2366,7 +1928,10 @@ mod dc_direct_tests {
             server,
         )
         .await;
-        println!("obfuscated intermediate: {}", obf.as_ref().map(|_| "ok").unwrap_or("fail"));
+        println!(
+            "obfuscated intermediate: {}",
+            obf.as_ref().map(|_| "ok").unwrap_or("fail")
+        );
         assert!(plain.is_ok() || obf.is_ok());
     }
 }
@@ -2397,7 +1962,15 @@ async fn ws_to_dc(dc: i16) -> Result<WsStream, String> {
     let mut errors = Vec::new();
     for sni in sni_candidates(&host) {
         let url = format!("wss://{ip}/apiws");
-        match connect_ws_once(&url, &format!("DC{dc}: таймаут WSS на {ip}"), true, None, Some(&host)).await {
+        match connect_ws_once(
+            &url,
+            &format!("DC{dc}: таймаут WSS на {ip}"),
+            true,
+            None,
+            Some(&host),
+        )
+        .await
+        {
             Ok(ws) => {
                 if std::env::var_os("GORILLA_WS_DEBUG").is_some() {
                     eprintln!("[dbg kws] DC{dc} {ip} SNI {sni}: рукопожатие прошло");
@@ -2452,7 +2025,10 @@ impl KwsPool {
                     let mut idle = pool_kws().idle.lock().await;
                     let queue = idle.entry(dc).or_default();
                     if queue.len() < 2 {
-                        queue.push_back(PooledWs { ws, created: Instant::now() });
+                        queue.push_back(PooledWs {
+                            ws,
+                            created: Instant::now(),
+                        });
                     }
                 }
                 Err(e) => {
@@ -2477,11 +2053,19 @@ pub async fn probe_kws(dc: i16) -> bool {
         return false;
     };
     let (init, mut enc, mut dec) = generate_relay_handshake(dc);
-    if ws.send(Message::Binary(init.to_vec().into())).await.is_err() {
+    if ws
+        .send(Message::Binary(init.to_vec().into()))
+        .await
+        .is_err()
+    {
         return false;
     }
     let mut frame = kws_packet(&mut enc);
-    if ws.send(Message::Binary(frame.drain(..).collect::<Vec<u8>>().into())).await.is_err() {
+    if ws
+        .send(Message::Binary(frame.drain(..).collect::<Vec<u8>>().into()))
+        .await
+        .is_err()
+    {
         return false;
     }
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -2503,42 +2087,6 @@ pub async fn probe_kws(dc: i16) -> bool {
         }
     }
 }
-
-/// Убирает служебный тег транспорта `ee ee ee ee` из начала клиентского
-/// потока. Тег идёт первым и единственным (grammers `Intermediate::pack`
-/// выставляет `init` после первой вставки), поэтому достаточно одного раза;
-/// дальше в потоке идут обычные 4-байтовые длины кадров.
-fn strip_transport_tag(pending: &mut Vec<u8>, stripped: &mut bool) {
-    if *stripped || pending.len() < 4 {
-        return;
-    }
-    if pending[..4] == [0xee; 4] {
-        pending.drain(..4);
-    }
-    *stripped = true;
-}
-
-/// Ищет смещение первого правдоподобного intermediate-кадра в начале потока:
-/// длина кадра лежит в первых 4 байтах, лежит в пределах разумного, и сам
-/// кадр уже уместился. Так мы пропускаем возможное 64-байтовое эхо relay-init,
-/// не отрезая настоящие данные.
-fn first_frame_offset(stream: &[u8], cap: usize) -> Option<usize> {
-    let mut off = 0usize;
-    while off + 4 <= stream.len() && off <= 256 {
-        let len = u32::from_le_bytes([
-            stream[off],
-            stream[off + 1],
-            stream[off + 2],
-            stream[off + 3],
-        ]) as usize;
-        if len >= 4 && len <= cap && stream.len() >= off + 4 + len {
-            return Some(off);
-        }
-        off += 4;
-    }
-    None
-}
-
 
 /// Пакет `req_pq_multi` в intermediate-транспорте (без тега — его несёт init).
 fn kws_packet(enc: &mut AesCtr256) -> Vec<u8> {
@@ -2656,7 +2204,11 @@ mod kws_tests {
             };
             let mut bytes = bytes.to_vec();
             dec.apply_keystream(&mut bytes);
-            println!("кадр {} байт: {:02x?}", bytes.len(), &bytes[..bytes.len().min(16)]);
+            println!(
+                "кадр {} байт: {:02x?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(16)]
+            );
             if bytes.len() > 4 {
                 break bytes;
             }
@@ -2683,11 +2235,12 @@ mod dc_ws_tests {
         use futures_util::{SinkExt as _, StreamExt as _};
         let (mut ws_send, mut ws_recv) = ws.split();
         let (init, mut enc, mut dec) = super::generate_relay_handshake(2);
-        ws_send.send(tokio_tungstenite::tungstenite::Message::Binary(
-            init.to_vec().into(),
-        ))
-        .await
-        .expect("init frame");
+        ws_send
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                init.to_vec().into(),
+            ))
+            .await
+            .expect("init frame");
         let msg_id = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("время")
@@ -2703,11 +2256,12 @@ mod dc_ws_tests {
         let mut frame = payload;
         use aes::cipher::StreamCipher as _;
         enc.apply_keystream(&mut frame);
-        ws_send.send(tokio_tungstenite::tungstenite::Message::Binary(
-            frame.into(),
-        ))
-        .await
-        .expect("data frame");
+        ws_send
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            ))
+            .await
+            .expect("data frame");
         let answer = tokio::time::timeout(std::time::Duration::from_secs(10), ws_recv.next())
             .await
             .expect("таймаут")
@@ -2717,87 +2271,14 @@ mod dc_ws_tests {
             tokio_tungstenite::tungstenite::Message::Binary(b) => b.to_vec(),
             other => panic!("не бинарный кадр: {other:?}"),
         };
-        println!("кадров {len}, первые байты {hex:02x?}", len = 1, hex = &raw[..raw.len().min(16)]);
-        use aes::cipher::StreamCipher as _;
+        println!(
+            "кадров {len}, первые байты {hex:02x?}",
+            len = 1,
+            hex = &raw[..raw.len().min(16)]
+        );
         dec.apply_keystream(&mut raw);
         println!("расшифровано: {:02x?}", &raw[..raw.len().min(16)]);
         let len = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         assert!(len > 0 && len < 1_000_000, "плохая длина {len}");
-    }
-}
-
-
-#[cfg(test)]
-mod tgws_relay_tests {
-    /// Живой релей до локального TgWsProxy: настоящий сценарий — init, затем
-    /// `req_pq_multi` в intermediate-кадре (init объявляет тег `\xee\xee\xee\xee`).
-    /// `cargo test --bin gorilla-bot tgws_relay -- --ignored --nocapture`
-
-    /// Проверка гипотезы: апстрим ждёт служебный тег `\xee\xee\xee\xee`
-    /// перед первым пакетом (так его шлёт grammers напрямую).
-    #[tokio::test]
-    #[ignore = "живая сеть"]
-    async fn tgws_relay_preamble() {
-        let addr: std::net::SocketAddr = "127.0.0.1:1443".parse().expect("адрес");
-        let secret = super::parse_secret("e00a3136e590b94046bb639c875ec14a").expect("секрет");
-        let (init, mut enc, mut dec) = super::generate_client_handshake(&secret, 2);
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("TCP до TgWsProxy");
-        let _ = stream.set_nodelay(true);
-        println!("[tgws] порт {}", stream.local_addr().expect("порт"));
-        use aes::cipher::StreamCipher as _;
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        stream.write_all(&init).await.expect("отправка init");
-
-        let mut frame = vec![0xeeu8, 0xee, 0xee, 0xee];
-        frame.extend_from_slice(&super::kws_packet(&mut enc));
-        enc.apply_keystream(&mut frame);
-        println!("[tgws] кадр с тегом {} байт", frame.len());
-        stream.write_all(&frame).await.expect("отправка req_pq");
-
-        let mut buf = vec![0u8; 1024];
-        match tokio::time::timeout(std::time::Duration::from_secs(12), stream.read(&mut buf)).await {
-            Ok(Ok(0)) => println!("[tgws] EOF — апстрим закрыл сессию"),
-            Ok(Ok(n)) => {
-                let mut body = buf[..n].to_vec();
-                dec.apply_keystream(&mut body);
-                println!("[tgws] ответ {} байт: {:02x?}", n, &body[..body.len().min(20)]);
-            }
-            Ok(Err(e)) => println!("[tgws] ошибка чтения: {e}"),
-            Err(_) => println!("[tgws] МОЛЧИТ 12 c"),
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "живая сеть"]
-    async fn tgws_relay_echo() {
-        let addr: std::net::SocketAddr = "127.0.0.1:1443".parse().expect("адрес");
-        let secret = super::parse_secret("e00a3136e590b94046bb639c875ec14a").expect("секрет");
-        let (init, mut enc, mut dec) = super::generate_client_handshake(&secret, 2);
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("TCP до TgWsProxy");
-        let _ = stream.set_nodelay(true);
-        println!("[tgws] порт {}", stream.local_addr().expect("порт"));
-        use aes::cipher::StreamCipher as _;
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        stream.write_all(&init).await.expect("отправка init");
-
-        let frame = super::kws_packet(&mut enc);
-        println!("[tgws] кадр {} байт, заголовок {:02x?}", frame.len(), &frame[..4]);
-        stream.write_all(&frame).await.expect("отправка req_pq");
-
-        let mut buf = vec![0u8; 1024];
-        match tokio::time::timeout(std::time::Duration::from_secs(15), stream.read(&mut buf)).await {
-            Ok(Ok(0)) => println!("[tgws] EOF — апстрим закрыл сессию"),
-            Ok(Ok(n)) => {
-                let mut body = buf[..n].to_vec();
-                dec.apply_keystream(&mut body);
-                println!(
-                    "[tgws] ответ {} байт, первые байты: {:02x?}",
-                    n,
-                    &body[..body.len().min(24)]
-                );
-            }
-            Ok(Err(e)) => println!("[tgws] ошибка чтения: {e}"),
-            Err(_) => println!("[tgws] МОЛЧИТ 15 c"),
-        }
     }
 }
