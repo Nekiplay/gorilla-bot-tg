@@ -291,21 +291,28 @@ async fn resolve_route(cfg: &Config) -> Result<Route, BoxError> {
             probe.reasons.join("; ")
         )
     };
+    eprintln!("[прокси] {pool_reason}");
+
 
     // Пул молчит (обычно провайдер режет TLS по SNI этих доменов).
-    // Тогда — свой воркер из настроек TgWsProxy, но говорим, если он выключен.
-    if let Some((worker, enabled)) = mtproxy::tgws_worker_domain() {
-        let local = mtproxy::spawn_worker_bridge(worker.clone()).await?;
-        let flag = if enabled {
-            "воркер включён в TgWsProxy"
+    // Воркер из чужого профиля TgWsProxy НЕ берём: это чужой аккаунт Cloudflare,
+    // и трафик не должен идти через него. Свой воркер задаётся явно — mtproxy.worker.
+
+    let dc_transport = match mtproxy::dc_probe(2).await {
+        Some(kind) if kind == mtproxy::Direct::Tls => Some(kind),
+        other => mtproxy::dc_probe(4).await.or(other),
+    };
+    if let Some(kind) = dc_transport {
+        let how = if kind == mtproxy::Direct::Tls {
+            "TLS + обфусцированный MTProto (как официальный клиент)"
         } else {
-            "воркер ВЫКЛЮЧЕН в TgWsProxy, беру его как последний вариант"
+            "прямой обфусцированный TCP (как tcp-fallback в tg-ws-proxy)"
         };
-        return Ok(finish(Route::bridge(
-            local,
-            format!("{pool_reason}; {flag}: «{worker}»"),
-        )));
+        let local = mtproxy::spawn_dc_bridge().await?;
+        return Ok(finish(Route::bridge(local, format!("{how} к DC Telegram"))));
     }
+
+
 
     // Локальный TgWsProxy: его секрет и порт берём из его же config.json,
     // чтобы пустой mtproxy.secret в config.json бота не блокировал подключение.

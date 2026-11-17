@@ -604,42 +604,6 @@ fn remember_reason(text: String) {
 /// секрет из его собственного `config.json` (`%APPDATA%\TgWsProxy\config.json`).
 /// Нужно, чтобы бот подключался к уже запущенному прокси, даже если в
 /// `config.json` бота `mtproxy.secret` пуст и порт отличается от стандартного.
-///
-/// Домен собственного Cloudflare-worker из настроек TgWsProxy
-/// (`cfproxy_worker_domain[0]`): публичный пул `kws*.*` часто не отвечает,
-/// а свой воркер у того же пользователя работает.
-///
-/// Воркер из настроек TgWsProxy: `(домен, включён ли он в самом TgWsProxy)`.
-///
-/// Второй элемент важен: если пользователь выключил свой воркер
-/// (`cfproxy_worker_enabled: false`), молча ходить через него нельзя —
-/// решение принимает вызывающий и говорит об этом в логе.
-pub fn tgws_worker_domain() -> Option<(String, bool)> {
-    let base = std::env::var_os("APPDATA")?;
-    let path = std::path::PathBuf::from(base)
-        .join("TgWsProxy")
-        .join("config.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let domains = value.get("cfproxy_worker_domain")?;
-    let first = match domains {
-        serde_json::Value::Array(items) => items.first()?.as_str()?.to_string(),
-        serde_json::Value::String(text) => text.clone(),
-        _ => return None,
-    };
-    let trimmed = first
-        .trim()
-        .trim_start_matches("https://")
-        .trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    let enabled = value
-        .get("cfproxy_worker_enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    Some((trimmed.to_string(), enabled))
-}
 
 pub fn tgws_local() -> Option<(String, u16, [u8; 16])> {
     let base = std::env::var_os("APPDATA")?;
@@ -745,6 +709,7 @@ pub async fn spawn_socks_bridge(
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
                     let target = Arc::clone(&target);
                     tokio::spawn(async move {
                         if let Err(e) = serve_client(stream, &target).await {
@@ -911,7 +876,11 @@ async fn latch_upstream(
         );
 
         let mut upstream = match TcpStream::connect(target.addr).await {
-            Ok(s) => s,
+            Ok(s) => {
+                // Мелкие MTProto-пакеты: без этого Nagle даёт +40 мс на обмен.
+                let _ = s.set_nodelay(true);
+                s
+            }
             Err(e) => {
                 println!("[мост] попытка {attempt}: прокси недоступен ({e}), пауза");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1089,6 +1058,7 @@ pub async fn spawn_worker_bridge(worker: String) -> Result<SocketAddr, String> {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
                     let worker = Arc::clone(&worker);
                     tokio::spawn(async move {
                         if let Err(e) = serve_worker_client(stream, &worker).await {
@@ -1133,9 +1103,40 @@ async fn connect_ws_once(
             .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("binary"));
     }
 
+    // Свой TLS-коннект вместо connect_async: только так сокет доступен до
+    // рукопожатия и получает TCP_NODELAY. Для мелких MTProto-пакетов это
+    // десятки миллисекунд на каждый обмен.
+    let host = url
+        .trim_start_matches("wss://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        TcpStream::connect((host.as_str(), 443)),
+    )
+    .await
+    .map_err(|_| timeout_msg.to_string())?
+    .map_err(|e| format!("TCP {host}:443: {e}"))?;
+    let _ = tcp.set_nodelay(true);
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(config));
+
     let (ws, response) = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        tokio_tungstenite::connect_async(request),
+        tokio_tungstenite::client_async_tls_with_config(
+            request,
+            tcp,
+            None,
+            Some(connector),
+        ),
     )
     .await
     .map_err(|_| timeout_msg.to_string())?
@@ -1313,12 +1314,297 @@ async fn pump(
     }
 }
 
+/// Пул тёплых WSS к собственному воркеру: TLS+WS-рукопожатие стоит сотни
+/// миллисекунд, а приложение переподключается к DC часто. Ключ пула — (DC, адрес
+/// целевого DC), потому что адрес попадает в запрос `?dst=`.
+#[derive(Default)]
+struct WorkerPool {
+    idle: Mutex<HashMap<(i16, IpAddr), VecDeque<PooledWs>>>,
+}
+
+static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
+
+fn worker_pool() -> &'static WorkerPool {
+    WORKER_POOL.get_or_init(WorkerPool::default)
+}
+
+// --- Прямой TCP к DC: копия `_tcp_fallback` из tg-ws-proxy ---------------------
+// Когда CF-пул лежит, апстрим льёт обфусцированный поток прямо на IP дата-центра
+// (без WSS и без Cloudflare). Пауза после отказа — как `TCP_BACKOFF_*`.
+
+const TCP_BACKOFF_INITIAL: f64 = 30.0;
+const TCP_BACKOFF_MAX: f64 = 3600.0;
+
+static TCP_BACKOFF: OnceLock<Mutex<HashMap<i16, (u32, Instant)>>> = OnceLock::new();
+
+fn tcp_backoff() -> &'static Mutex<HashMap<i16, (u32, Instant)>> {
+    TCP_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Адрес DC для прямого TCP (`DC_DEFAULT_IPS` апстрима, не `dc_ip` профиля).
+fn dc_default_ip(dc: i16) -> Option<&'static str> {
+    Some(match dc.abs() {
+        1 => "149.154.175.50",
+        2 => "149.154.167.51",
+        3 => "149.154.175.100",
+        4 => "149.154.167.91",
+        5 => "149.154.171.5",
+        203 => "91.105.192.100",
+        _ => return None,
+    })
+}
+
+/// `dc_ip` из профиля TgWsProxy (`parse_dc_ip_list`, формат `DC:IP`).
+/// Апстрим ходит на эти адреса (`dc_redirects` по умолчанию 149.154.167.220),
+/// а `DC_DEFAULT_IPS` — только запасной вариант.
+fn tgws_dc_ips() -> HashMap<i16, String> {
+    let mut map = HashMap::new();
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return map;
+    };
+    let path = std::path::PathBuf::from(base)
+        .join("TgWsProxy")
+        .join("config.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return map;
+    };
+    let Some(list) = value.get("dc_ip").and_then(|list| list.as_array()) else {
+        return map;
+    };
+    for entry in list.iter().filter_map(|entry| entry.as_str()) {
+        let Some((dc, ip)) = entry.split_once(':') else {
+            continue;
+        };
+        let (Ok(dc), Ok(ip)) = (dc.trim().parse::<i16>(), ip.trim().parse::<IpAddr>()) else {
+            continue;
+        };
+        map.insert(dc, ip.to_string());
+    }
+    map
+}
+
+/// Адрес DC: сначала переопределение из профиля TgWsProxy, затем стандартный.
+fn dc_address(dc: i16) -> Option<String> {
+    let dc = dc.abs();
+    tgws_dc_ips()
+        .get(&dc)
+        .cloned()
+        .or_else(|| dc_default_ip(dc).map(str::to_string))
+}
+
+/// Живо ли прямое TCP-соединение с DC (проверка для выбора маршрута).
+/// Транспорт до дата-центра.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direct {
+    /// Голый обфусцированный TCP — как tcp-fallback в tg-ws-proxy.
+    Tcp,
+    /// Обфусцированный поток внутри TLS (транспорт официальных клиентов).
+    Tls,
+}
+
+/// Домены для SNI при TLS-транспорте: Telegram не проверяет сертификат,
+/// поэтому годится любой «обычный» домен.
+const TLS_SNIS: [&str; 4] = [
+    "web.telegram.org",
+    "telegram.org",
+    "www.google.com",
+    "www.microsoft.com",
+];
+
+fn tls_domain() -> &'static str {
+    let index = rand::random::<u8>() as usize % TLS_SNIS.len();
+    TLS_SNIS[index]
+}
+
+/// Проверяет, каким транспортом DC реально отвечает: сначала TLS
+/// (официальный клиент ходит так), затем голый обфусцированный поток.
+pub async fn dc_probe(dc: i16) -> Option<Direct> {
+    let ip = dc_address(dc)?;
+    if probe_tls(dc, &ip).await {
+        return Some(Direct::Tls);
+    }
+    let address = format!("{ip}:443").parse::<std::net::SocketAddr>().ok()?;
+    let server = grammers_mtsender::ServerAddr::Tcp { address };
+    let handshake =
+        grammers_mtsender::connect(grammers_mtproto::transport::Intermediate::new(), server);
+    if tokio::time::timeout(Duration::from_secs(8), handshake)
+        .await
+        .is_ok_and(|result| result.is_ok())
+    {
+        return Some(Direct::Tcp);
+    }
+    None
+}
+
+/// TLS-рукопожатие + первый обмен: DC должен ответить MTProto-кадром,
+/// а не страницей HTTP (на `149.154.167.220` приходит `HTTP/1.1 302`).
+async fn probe_tls(dc: i16, ip: &str) -> bool {
+    let Ok(mut stream) = tls_upstream(ip).await else {
+        return false;
+    };
+    let (init, mut enc, _dec) = generate_relay_handshake(dc);
+    if stream.write_all(&init).await.is_err() {
+        return false;
+    }
+    let mut payload = vec![0u8; 8];
+    payload.extend_from_slice(&0i64.to_le_bytes());
+    payload.extend_from_slice(&24u32.to_le_bytes());
+    payload.extend_from_slice(&0xbe7e_8ef1u32.to_le_bytes());
+    payload.extend_from_slice(&[0u8; 16]);
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+    enc.apply_keystream(&mut frame);
+    if stream.write_all(&frame).await.is_err() {
+        return false;
+    }
+    let mut first = [0u8; 8];
+    let read = tokio::time::timeout(Duration::from_secs(6), stream.read_exact(&mut first)).await;
+    matches!(read, Ok(Ok(_))) && !first.starts_with(b"HTTP")
+}
+
+/// TLS до DC без проверки сертификата: у Telegram на 443 стоит свой
+/// сертификат, официальные клиенты его не валидируют.
+async fn tls_upstream(ip: &str) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS: версии протокола: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((ip, 443)))
+        .await
+        .map_err(|_| format!("TLS: таймаут TCP {ip}:443"))?
+        .map_err(|e| format!("TLS: TCP {ip}:443: {e}"))?;
+    let _ = stream.set_nodelay(true);
+
+    let name = tls_domain();
+    let server_name = rustls::pki_types::ServerName::try_from(name.to_string())
+        .map_err(|e| format!("TLS: имя {name}: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, stream))
+        .await
+        .map_err(|_| "TLS: таймаут рукопожатия".to_string())?
+        .map_err(|e| format!("TLS: рукопожатие: {e}"))
+}
+
+/// Проверялка сертификата «принимаем любой».
+#[derive(Debug)]
+struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+
+/// Свежее подключение к воркеру через тот же рукопожатный конвейер.
+async fn dial_worker(dc: i16, dst: IpAddr, worker: &str) -> Result<WsStream, String> {
+    let url = format!("wss://{worker}/apiws?dst={dst}&dc={}", dc.abs());
+    connect_ws(&url, &format!("таймаут WSS-подключения к {worker}")).await
+}
+
+impl WorkerPool {
+    /// Готовый туннель или живое подключение; запас на следующий раз
+    /// догревается в фоне, чтобы переподключение приложения не ждало TLS.
+    async fn acquire(&self, dc: i16, dst: IpAddr, worker: &str) -> Result<WsStream, String> {
+        let key = (dc, dst);
+        let warmed = {
+            let mut idle = self.idle.lock().await;
+            let queue = idle.entry(key).or_default();
+            let mut found = None;
+            while let Some(item) = queue.pop_front() {
+                if item.created.elapsed() < POOL_MAX_AGE {
+                    found = Some(item.ws);
+                    break;
+                }
+            }
+            found
+        };
+
+        let worker = worker.to_string();
+        let refill_worker = worker.clone();
+        tokio::spawn(async move {
+            let idle = worker_pool().idle.lock().await;
+            let busy = idle.get(&key).is_some_and(|queue| !queue.is_empty());
+            drop(idle);
+            if busy {
+                return;
+            }
+            match dial_worker(dc, dst, &refill_worker).await {
+                Ok(ws) => {
+                    let mut idle = worker_pool().idle.lock().await;
+                    let queue = idle.entry(key).or_default();
+                    if queue.len() < 2 {
+                        queue.push_back(PooledWs {
+                            ws,
+                            created: Instant::now(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    if std::env::var_os("GORILLA_WS_DEBUG").is_some() {
+                        eprintln!("[dbg пул воркера] DC{dc} {dst}: {e}");
+                    }
+                }
+            }
+        });
+
+        match warmed {
+            Some(ws) => Ok(ws),
+            None => dial_worker(dc, dst, worker.as_str()).await,
+        }
+    }
+}
+
 /// Одно клиентское подключение через worker: SOCKS5 → WSS → DC.
 async fn serve_worker_client(mut client: TcpStream, worker: &str) -> Result<(), String> {
     let (dst_ip, dc_idx) = socks_accept(&mut client).await?;
-    let url = format!("wss://{worker}/apiws?dst={dst_ip}&dc={}", dc_idx.abs());
-
-    let mut ws = connect_ws(&url, &format!("таймаут WSS-подключения к {worker}")).await?;
+    let mut ws = worker_pool().acquire(dc_idx.abs(), dst_ip, worker).await?;
     let (init, enc, dec) = generate_relay_handshake(dc_idx);
     ws.send(Message::Binary(init.to_vec().into()))
         .await
@@ -1680,6 +1966,7 @@ pub async fn spawn_cfproxy_bridge() -> Result<SocketAddr, String> {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
                     tokio::spawn(async move {
                         if let Err(e) = serve_cfproxy_client(stream).await {
                             eprintln!("[cf-прокси] соединение закрыто: {e}");
@@ -1695,6 +1982,102 @@ pub async fn spawn_cfproxy_bridge() -> Result<SocketAddr, String> {
     });
 
     Ok(local)
+}
+
+/// Мост «прямой TCP к DC» — аналог `_tcp_fallback` из tg-ws-proxy: когда CF
+/// недоступен, обфусцированный поток идёт прямо на IP дата-центра.
+pub async fn spawn_dc_bridge() -> Result<SocketAddr, String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("не удалось занять локальный порт под мост: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("адрес моста: {e}"))?;
+
+    println!("[dc-tcp] локальный SOCKS5: {local} → DC Telegram напрямую");
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_dc_client(stream).await {
+                            eprintln!("[dc-tcp] соединение закрыто: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[dc-tcp] приём подключений: {e}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    Ok(local)
+}
+
+/// Одно клиентское подключение напрямую в DC: SOCKS5 → TCP:443 → обфускация.
+async fn serve_dc_client(mut client: TcpStream) -> Result<(), String> {
+    let (_, dc_idx) = socks_accept(&mut client).await?;
+    let dc = dc_idx.abs();
+    let ip = dc_address(dc).ok_or_else(|| format!("DC{dc}: нет адреса для прямого TCP"))?;
+
+    let pause = {
+        let map = tcp_backoff().lock().await;
+        match map.get(&dc) {
+            Some((failures, until)) if Instant::now() < *until => {
+                Some(format!("DC{dc}: прямой TCP на паузе после {failures} отказов"))
+            }
+            _ => None,
+        }
+    };
+    if let Some(reason) = pause {
+        return Err(reason);
+    }
+
+    let (init, enc, dec) = generate_relay_handshake(dc_idx);
+    let transport = dc_probe(dc).await;
+    if transport.is_none() {
+        record_tcp_failure(dc).await;
+        return Err(format!("DC{dc}: не отвечает ни по TLS, ни обфусцированным TCP"));
+    }
+    tcp_backoff().lock().await.remove(&dc);
+
+    match transport {
+        Some(Direct::Tls) => {
+            let mut upstream = tls_upstream(&ip).await?;
+            upstream
+                .write_all(&init)
+                .await
+                .map_err(|e| format!("DC{dc}: отправка рукопожатия в TLS: {e}"))?;
+            relay(client, upstream, enc, dec).await
+        }
+        _ => {
+            let mut upstream =
+                tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((ip.as_str(), 443)))
+                    .await
+                    .map_err(|_| format!("DC{dc}: таймаут TCP {ip}:443"))?
+                    .map_err(|e| format!("DC{dc}: TCP {ip}:443: {e}"))?;
+            let _ = upstream.set_nodelay(true);
+            upstream
+                .write_all(&init)
+                .await
+                .map_err(|e| format!("DC{dc}: отправка рукопожатия: {e}"))?;
+            relay(client, upstream, enc, dec).await
+        }
+    }
+}
+
+/// Пауза после отказа (30 c, дальше вдвое, максимум 3600), как в апстриме.
+async fn record_tcp_failure(dc: i16) {
+    let mut map = tcp_backoff().lock().await;
+    let entry = map.entry(dc).or_insert((0, Instant::now()));
+    entry.0 += 1;
+    let delay = (TCP_BACKOFF_INITIAL * 2f64.powi(entry.0.saturating_sub(1) as i32))
+        .min(TCP_BACKOFF_MAX);
+    entry.1 = Instant::now() + Duration::from_secs_f64(delay);
 }
 
 /// Одно клиентское подключение через стандартный CF-прокси: SOCKS5 → WSS → DC.
@@ -1738,14 +2121,12 @@ async fn serve_client(mut client: TcpStream, target: &Target) -> Result<(), Stri
 }
 
 /// Двунаправленная пересылка с AES-CTR поверх обоих направлений.
-async fn relay(
-    mut client: TcpStream,
-    mut upstream: TcpStream,
-    enc: AesCtr256,
-    dec: AesCtr256,
-) -> Result<(), String> {
+async fn relay<U>(mut client: TcpStream, upstream: U, enc: AesCtr256, dec: AesCtr256) -> Result<(), String>
+where
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     let (mut from_client, mut to_client) = client.split();
-    let (mut from_upstream, mut to_upstream) = upstream.split();
+    let (mut from_upstream, mut to_upstream) = tokio::io::split(upstream);
 
     let enc = Arc::new(Mutex::new(enc));
     let dec = Arc::new(Mutex::new(dec));
@@ -1869,5 +2250,92 @@ mod local_probe_tests {
         });
         assert_eq!(probe_local("127.0.0.1", port).await, LocalKind::Open);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod dc_direct_tests {
+    /// Прямой TCP к DC без прокси: проверка, что дата-центр вообще принимает
+    /// обфусцированный транспорт с этого адреса. Запускать вручную:
+    /// `cargo test --bin gorilla-bot dc_direct -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "живая сеть"]
+    async fn dc_direct_handshake() {
+        let addr = super::dc_address(2).expect("адрес DC2");
+        let target: std::net::SocketAddr = format!("{addr}:443").parse().expect("адрес");
+        let server = grammers_mtsender::ServerAddr::Tcp { address: target };
+        let plain: Result<_, _> = grammers_mtsender::connect(
+            grammers_mtproto::transport::Intermediate::new(),
+            server.clone(),
+        )
+        .await;
+        println!("plain intermediate: {}", plain.as_ref().map(|_| "ok").unwrap_or("fail"));
+        let obf = grammers_mtsender::connect(
+            grammers_mtproto::transport::Obfuscated::new(
+                grammers_mtproto::transport::Intermediate::new(),
+            ),
+            server,
+        )
+        .await;
+        println!("obfuscated intermediate: {}", obf.as_ref().map(|_| "ok").unwrap_or("fail"));
+        assert!(plain.is_ok() || obf.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod dc_ws_tests {
+    /// WSS прямо в дата-центр: 149.154.167.220:443 отвечает на TLS
+    /// `HTTP/1.1 400 Bad Request`, значит это не голый TCP-транспорт,
+    /// а WebSocket-точка `/apiws` (как kws*.web.telegram.org).
+    #[tokio::test]
+    #[ignore = "живая сеть"]
+    async fn dc_ws_handshake() {
+        let ip = super::dc_address(2).expect("адрес DC2");
+        let url = format!("wss://{ip}/apiws?dst={ip}&dc=2");
+        let ws = super::connect_ws(&url, "DC ws").await.expect("ws");
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let (mut ws_send, mut ws_recv) = ws.split();
+        let (init, mut enc, mut dec) = super::generate_relay_handshake(2);
+        ws_send.send(tokio_tungstenite::tungstenite::Message::Binary(
+            init.to_vec().into(),
+        ))
+        .await
+        .expect("init frame");
+        let msg_id = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("время")
+            .as_secs_f64()
+            * 4294967296.0) as i64
+            & !3;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 8]);
+        payload.extend_from_slice(&msg_id.to_le_bytes());
+        payload.extend_from_slice(&24u32.to_le_bytes());
+        payload.extend_from_slice(&0xbe7e_8ef1u32.to_le_bytes());
+        payload.extend_from_slice(&[7u8; 16]);
+        let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        use aes::cipher::StreamCipher as _;
+        enc.apply_keystream(&mut frame);
+        ws_send.send(tokio_tungstenite::tungstenite::Message::Binary(
+            frame.into(),
+        ))
+        .await
+        .expect("data frame");
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), ws_recv.next())
+            .await
+            .expect("таймаут")
+            .expect("кадр")
+            .expect("ошибка ws");
+        let mut raw = match answer {
+            tokio_tungstenite::tungstenite::Message::Binary(b) => b.to_vec(),
+            other => panic!("не бинарный кадр: {other:?}"),
+        };
+        println!("кадров {len}, первые байты {hex:02x?}", len = 1, hex = &raw[..raw.len().min(16)]);
+        use aes::cipher::StreamCipher as _;
+        dec.apply_keystream(&mut raw);
+        println!("расшифровано: {:02x?}", &raw[..raw.len().min(16)]);
+        let len = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        assert!(len > 0 && len < 1_000_000, "плохая длина {len}");
     }
 }
