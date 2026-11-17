@@ -2070,12 +2070,16 @@ fn spawn_pet(shared: Arc<Shared>) {
             }
 
             match pet_once(&shared, &cfg).await {
-                Ok(PetTrip::Started) => {
+                Ok(PetTrip::Started { cooldown }) => {
                     // Сообщение о возврате приходит через часы, ждать его нельзя:
-                    // cледующий поход ставим сразу — через интервал из настроек.
+                    // следующий поход ставим сразу — через интервал из настроек,
+                    // либо через срок из отказа бота («через 15 мин. 27 сек.»).
                     let now = now_unix();
                     shared.set_last_pet(now);
                     shared.reschedule_pet();
+                    if let Some(secs) = cooldown {
+                        shared.set_next_pet(now + secs as i64 + 20);
+                    }
                     let next = shared.next_pet_at().unwrap_or(now);
                     shared.log(format!(
                         "[питомец] поход начат — следующий через {}",
@@ -2113,7 +2117,8 @@ pub(crate) fn pet_prep_command(reply: &str) -> Option<String> {
 
 /// Чем закончился поход: начался (бот ответил) или бот промолчал.
 enum PetTrip {
-    Started,
+    /// `cooldown` — сколько бот велел ждать до следующей попытки.
+    Started { cooldown: Option<u64> },
     Silent,
 }
 
@@ -2154,7 +2159,14 @@ async fn pet_once(shared: &Shared, cfg: &Config) -> Result<PetTrip, BoxError> {
                     shared.note_income(sum);
                 }
             }
-            Ok(PetTrip::Started)
+            let cooldown = pet_cooldown(&text);
+            if let Some(secs) = cooldown {
+                shared.log(format!(
+                    "[питомец] бот не готов, поводок: через {}",
+                    fmt_secs(secs as i64)
+                ));
+            }
+            Ok(PetTrip::Started { cooldown })
         }
         // Бот промолчал: «последний поход» не двигаем, повторяем скоро —
         // иначе таймер уйдёт на полный интервал из-за потерянной команды.
@@ -2174,6 +2186,61 @@ pub(crate) fn pet_is_return(text: &str) -> bool {
     let lower = text.to_lowercase();
     (lower.contains("вернулся") && lower.contains("поход"))
         || (lower.contains("питомец") && lower.contains("зачислено"))
+}
+
+/// Сколько бот велел ждать: «вы сможете отправить питомца в поход через
+/// 15 мин. 27 сек. ❌» → 927 секунд. Отказы другого вида сюда не попадают.
+pub(crate) fn pet_cooldown(text: &str) -> Option<u64> {
+    let lower = text.to_lowercase();
+    let at = lower.rfind("через")?;
+    let tail = &lower[at + "через".len()..];
+    let mut total = 0u64;
+    let mut pending: Option<u64> = None;
+    for word in tail.split_whitespace() {
+        let digits: String = word.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let unit: String = word
+            .chars()
+            .skip(digits.chars().count())
+            .filter(|c| c.is_alphabetic())
+            .collect();
+        if !digits.is_empty() {
+            let value: u64 = digits.parse().ok()?;
+            if unit.is_empty() {
+                pending = Some(value);
+            } else {
+                total += value * duration_unit(&unit)?;
+                pending = None;
+            }
+            continue;
+        }
+        if unit.is_empty() {
+            continue;
+        }
+        if let Some(value) = pending.take() {
+            if let Some(mult) = duration_unit(&unit) {
+                total += value * mult;
+            }
+        }
+    }
+    if total == 0 {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+/// Единица измерения из ответа бота в секундах.
+fn duration_unit(unit: &str) -> Option<u64> {
+    let unit = unit.to_lowercase();
+    if unit.starts_with("час") || unit == "ч" || unit == "h" {
+        Some(3_600)
+    } else if unit.starts_with("мин") || unit == "m" {
+        Some(60)
+    } else if unit.starts_with("сек") || unit == "s" {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 /// Сравниваем настройки таймера бонуса (для пересчёта срока).
@@ -2891,6 +2958,20 @@ mod tests {
             "Nekiplay, покормите своего питомца чтобы отправить его в поход"
         ));
         assert!(!super::pet_is_return("🎁 Бонус получен, зачислено 1000$"));
+    }
+
+    #[test]
+    fn pet_cooldown_is_parsed() {
+        assert_eq!(
+            super::pet_cooldown("Nekiplay, вы сможете отправить питомца в поход через 15 мин. 27 сек. ❌"),
+            Some(927)
+        );
+        assert_eq!(
+            super::pet_cooldown("Питомец вернётся через 1 час 5 мин"),
+            Some(3_900)
+        );
+        assert_eq!(super::pet_cooldown("через 40 сек"), Some(40));
+        assert_eq!(super::pet_cooldown("Питомец отправился в поход"), None);
     }
 
     #[test]
