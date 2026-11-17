@@ -248,90 +248,19 @@ async fn resolve_route(cfg: &Config) -> Result<Route, BoxError> {
         mtproxy::LocalKind::Open => open_needs_secret = true,
         mtproxy::LocalKind::Closed => {}
     }
-
-    // Стандартный пул tg-ws-proxy (`kws<dc>.<домен>`): основной путь, когда
-    // свой воркер не задан. Проверяем, отвечает ли он из этой сети — иначе
-    // молчаливые таймауты, как раньше с `kws2.*`.
-    if !mt.cf_domains.is_empty() {
-        let joined = mt.cf_domains.join(
-            "
-",
-        );
-        let accepted = mtproxy::set_cf_domains(mtproxy::parse_cf_domains(&joined));
-        if accepted > 0 {
-            println!("[cf-прокси] свой список доменов пула: {accepted}");
-        } else {
-            eprintln!("[cf-прокси] список mtproxy.cf_domains не принят, беру стандартный");
-        }
-    }
-    // Список доменов апстрим держит в репозитории и обновляет — берём свежий.
-    match mtproxy::refresh_cf_domains().await {
-        Ok(count) => println!("[cf-прокси] список доменов обновлён из репозитория: {count}"),
-        Err(e) => eprintln!("[cf-прокси] свежий список не получен ({e}), беру зашитый"),
-    }
-
-    // Домены, которых больше нет в списке, убираем и из счёта.
-    if let Ok(mut scores) = crate::balancer::global().lock() {
-        scores.retain_domains(&mtproxy::cf_domains());
-    }
-
-    let probe = mtproxy::cf_pool_probe().await;
-    if let Some(live) = probe.live.clone() {
-        let local = mtproxy::spawn_cfproxy_bridge().await?;
+    // Плагин: локальный TgWsProxy — рабочий путь из этой сети (DPD режет всё
+    // остальное: CF-домены пула, прямой DC и WS-пул `kws*` не отвечают).
+    if let Some(target) = mtproxy::tgws_target(cfg) {
+        let secret = mtproxy::tgws_secret(cfg).ok_or_else(|| {
+            format!(
+                "локальный TgWsProxy {target} включён, но секрет неизвестен: впиши mtproxy.tgws_secret или разреши чтение его config.json (mtproxy.tgws_local = true)"
+            )
+        })?;
+        let local = mtproxy::spawn_socks_bridge(target, secret).await?;
         return Ok(finish(Route::bridge(
             local,
-            format!("стандартный пул tg-ws-proxy (kws*.*), ответил {live}"),
+            format!("плагин: локальный TgWsProxy {target}"),
         )));
-    }
-    let pool_reason = if probe.reasons.is_empty() {
-        "стандартный пул tg-ws-proxy не ответил".to_string()
-    } else {
-        format!(
-            "стандартный пул tg-ws-proxy не ответил: {}",
-            probe.reasons.join("; ")
-        )
-    };
-    eprintln!("[прокси] {pool_reason}");
-
-
-    // Пул молчит (обычно провайдер режет TLS по SNI этих доменов).
-    // Воркер из чужого профиля TgWsProxy НЕ берём: это чужой аккаунт Cloudflare,
-    // и трафик не должен идти через него. Свой воркер задаётся явно — mtproxy.worker.
-
-    let dc_transport = match mtproxy::dc_probe(2).await {
-        Some(kind) if kind == mtproxy::Direct::Tls => Some(kind),
-        other => mtproxy::dc_probe(4).await.or(other),
-    };
-    if let Some(kind) = dc_transport {
-        let how = if kind == mtproxy::Direct::Tls {
-            "TLS + обфусцированный MTProto (как официальный клиент)"
-        } else {
-            "прямой обфусцированный TCP (как tcp-fallback в tg-ws-proxy)"
-        };
-        let local = mtproxy::spawn_dc_bridge().await?;
-        return Ok(finish(Route::bridge(local, format!("{how} к DC Telegram"))));
-    }
-
-
-
-    // Локальный TgWsProxy: его секрет и порт берём из его же config.json,
-    // чтобы пустой mtproxy.secret в config.json бота не блокировал подключение.
-    if kind != mtproxy::LocalKind::Socks5 {
-        if let Some((tgws_host, tgws_port, secret)) = mtproxy::tgws_local() {
-            let target = std::net::SocketAddr::new(
-                tgws_host
-                    .parse()
-                    .map_err(|e| format!("адрес TgWsProxy «{tgws_host}»: {e}"))?,
-                tgws_port,
-            );
-            let local = mtproxy::spawn_socks_bridge(target, secret).await?;
-            return Ok(finish(Route::bridge(
-                local,
-                format!(
-                    "локальный TgWsProxy {tgws_host}:{tgws_port} (секрет взят из его config.json)"
-                ),
-            )));
-        }
     }
 
     if open_needs_secret {
@@ -360,11 +289,10 @@ async fn resolve_route(cfg: &Config) -> Result<Route, BoxError> {
         }));
     }
 
-    // Ни локального прокси, ни живого пула, ни воркера — честно говорим.
+    // Ни локального прокси, ни плагина, ни воркера — честно говорим.
     Err(format!(
-        "{}; стандартный пул tg-ws-proxy (kws*.*) не отвечает (провайдер режет TLS по SNI), своего воркера нет: запусти локальный прокси на {host}:{} и впиши его mtproxy.secret, либо укажи mtproxy.worker = \"<свой>.workers.dev\"",
-        kind.describe(host, mt.port),
-        mt.port
+        "{}; локального прокси нет, плагин TgWsProxy не включён (mtproxy.tgws), своего воркера нет: запусти TgWsProxy (Flowseal/tg-ws-proxy) на 127.0.0.1:1443 или впиши туда свой адрес, либо укажи mtproxy.worker = \"<свой>.workers.dev\"",
+        kind.describe(host, mt.port)
     )
     .into())
 }

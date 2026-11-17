@@ -92,8 +92,21 @@ pub struct MtProxyConfig {
     /// Сколько секунд живёт замер задержки домена (TTL счёта балансировщика).
     #[serde(default = "default_score_ttl")]
     pub score_ttl: u64,
+    /// Плагин: адрес локального TgWsProxy (`127.0.0.1:1443`). Задан — бот
+    /// поднимает свой SOCKS5 и ходит к Telegram через эту внешнюю программу.
+    #[serde(default)]
+    pub tgws: String,
+    /// Секрет того же TgWsProxy (hex, с `dd` или без).
+    #[serde(default)]
+    pub tgws_secret: String,
+    /// Искать TgWsProxy самому — читать его `config.json` (порт и секрет).
+    #[serde(default = "default_true")]
+    pub tgws_local: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
 fn default_mtp_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -114,6 +127,10 @@ fn default_score_ttl() -> u64 {
     600
 }
 
+pub fn default_tgws_port() -> u16 {
+    1443
+}
+
 impl Default for MtProxyConfig {
     fn default() -> Self {
         Self {
@@ -125,6 +142,9 @@ impl Default for MtProxyConfig {
             pool_size: default_pool_size(),
             probe_parallel: default_probe_parallel(),
             score_ttl: default_score_ttl(),
+            tgws: String::new(),
+            tgws_secret: String::new(),
+            tgws_local: true,
         }
     }
 }
