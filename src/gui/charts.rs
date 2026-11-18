@@ -34,7 +34,7 @@ struct Point {
 /// Замеры в часовые точки линии; `take` достаёт метрику из замера.
 ///
 /// В каждом часе берём последний замер — поминутные точки сливались в кашу.
-/// Отдаём от новых к старым: свежее слева, старую историю листают вправо.
+/// Отдаём от старых к новым: время на оси идёт слева направо.
 fn series(history: &History, take: impl Fn(&Sample) -> Option<f64>) -> Vec<Point> {
     let mut points: Vec<(i64, Point)> = Vec::new();
     for sample in history.samples() {
@@ -54,7 +54,6 @@ fn series(history: &History, take: impl Fn(&Sample) -> Option<f64>) -> Vec<Point
     let start = points.len().saturating_sub(MAX_POINTS);
     points[start..]
         .iter()
-        .rev()
         .map(|(_, point)| point.clone())
         .collect()
 }
